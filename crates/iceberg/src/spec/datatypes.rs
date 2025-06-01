@@ -25,13 +25,16 @@ use std::ops::Index;
 use std::sync::{Arc, OnceLock};
 
 use ::serde::de::{MapAccess, Visitor};
-use serde::de::{Error, IntoDeserializer};
+// Added for TryFrom<ArrowDataType>
+use arrow_schema::DataType as ArrowDataType;
+use arrow_schema::TimeUnit as ArrowTimeUnit;
+use serde::de::{Error as SerdeError, IntoDeserializer};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use serde_json::Value as JsonValue;
 
 use super::values::Literal;
 use crate::ensure_data_valid;
-use crate::error::Result;
+use crate::error::{Error, ErrorKind, Result}; // Added Error and ErrorKind
 use crate::spec::PrimitiveLiteral;
 use crate::spec::datatypes::_decimal::{MAX_PRECISION, REQUIRED_LENGTH};
 
@@ -271,6 +274,72 @@ impl PrimitiveType {
                 | (PrimitiveType::Fixed(_), PrimitiveLiteral::Binary(_))
                 | (PrimitiveType::Binary, PrimitiveLiteral::Binary(_))
         )
+    }
+}
+
+impl TryFrom<ArrowDataType> for PrimitiveType {
+    type Error = Error;
+
+    fn try_from(value: ArrowDataType) -> Result<Self, Self::Error> {
+        match value {
+            ArrowDataType::Boolean => Ok(PrimitiveType::Boolean),
+            ArrowDataType::Int32 => Ok(PrimitiveType::Int),
+            ArrowDataType::Int64 => Ok(PrimitiveType::Long),
+            ArrowDataType::Float32 => Ok(PrimitiveType::Float),
+            ArrowDataType::Float64 => Ok(PrimitiveType::Double),
+            ArrowDataType::Date32 => Ok(PrimitiveType::Date),
+            // Arrow Date64 can also map to Date, but Date32 is more common.
+            // For simplicity, only Date32 is mapped here.
+            // Add Date64 if specific use case requires it.
+
+            // Iceberg Time is microsecond precision.
+            ArrowDataType::Time64(ArrowTimeUnit::Microsecond) => Ok(PrimitiveType::Time),
+
+            ArrowDataType::Timestamp(ArrowTimeUnit::Microsecond, None) => {
+                Ok(PrimitiveType::Timestamp)
+            }
+            ArrowDataType::Timestamp(ArrowTimeUnit::Microsecond, Some(_)) => {
+                Ok(PrimitiveType::Timestamptz)
+            }
+            ArrowDataType::Timestamp(ArrowTimeUnit::Nanosecond, None) => {
+                Ok(PrimitiveType::TimestampNs)
+            }
+            ArrowDataType::Timestamp(ArrowTimeUnit::Nanosecond, Some(_)) => {
+                Ok(PrimitiveType::TimestamptzNs)
+            }
+
+            ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => Ok(PrimitiveType::String),
+            ArrowDataType::Binary | ArrowDataType::LargeBinary => Ok(PrimitiveType::Binary),
+            ArrowDataType::FixedSizeBinary(len) => Ok(PrimitiveType::Fixed(len as u64)),
+            // Note: UUID from FixedSizeBinary(16) typically requires metadata check,
+            // which is not available at DataType level. String "Uuid" is handled elsewhere.
+            ArrowDataType::Decimal128(precision, scale) => {
+                // Iceberg scale must be non-negative. Arrow scale can be negative.
+                let iceberg_scale = if scale < 0 {
+                    return Err(Error::new(
+                        ErrorKind::FeatureUnsupported,
+                        format!(
+                            "Arrow Decimal with negative scale {} not supported for Iceberg Decimal",
+                            scale
+                        ),
+                    ));
+                } else {
+                    scale as u32
+                };
+                Ok(PrimitiveType::Decimal {
+                    precision: precision as u32,
+                    scale: iceberg_scale,
+                })
+            }
+            // Other Arrow types that are not directly supported or require more context/metadata
+            other => Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                format!(
+                    "Arrow type {:?} cannot be directly converted to an Iceberg PrimitiveType without further context or is unsupported.",
+                    other
+                ),
+            )),
+        }
     }
 }
 
