@@ -357,12 +357,12 @@ impl From<PrimitiveType> for ArrowDataType {
             PrimitiveType::Timestamptz => {
                 // When converting from Timestamptz, a timezone string is required for Arrow.
                 // "UTC" is a common default if no specific timezone information is available.
-                ArrowDataType::Timestamp(ArrowTimeUnit::Microsecond, Some("UTC".into()))
+                ArrowDataType::Timestamp(ArrowTimeUnit::Microsecond, Some("+00:00".into()))
             }
             PrimitiveType::TimestampNs => ArrowDataType::Timestamp(ArrowTimeUnit::Nanosecond, None),
             PrimitiveType::TimestamptzNs => {
                 // Similar to Timestamptz, provide a default timezone for nanosecond precision.
-                ArrowDataType::Timestamp(ArrowTimeUnit::Nanosecond, Some("UTC".into()))
+                ArrowDataType::Timestamp(ArrowTimeUnit::Nanosecond, Some("+00:00".into()))
             }
             PrimitiveType::String => ArrowDataType::Utf8,
             PrimitiveType::Binary => ArrowDataType::Binary,
