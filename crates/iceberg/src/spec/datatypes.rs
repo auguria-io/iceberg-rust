@@ -280,7 +280,7 @@ impl PrimitiveType {
 impl TryFrom<ArrowDataType> for PrimitiveType {
     type Error = Error;
 
-    fn try_from(value: ArrowDataType) -> Result<Self, Self::Error> {
+    fn try_from(value: ArrowDataType) -> Result<Self> {
         match value {
             ArrowDataType::Boolean => Ok(PrimitiveType::Boolean),
             ArrowDataType::Int32 => Ok(PrimitiveType::Int),
