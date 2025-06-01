@@ -343,6 +343,50 @@ impl TryFrom<ArrowDataType> for PrimitiveType {
     }
 }
 
+impl From<PrimitiveType> for ArrowDataType {
+    fn from(value: PrimitiveType) -> Self {
+        match value {
+            PrimitiveType::Boolean => ArrowDataType::Boolean,
+            PrimitiveType::Int => ArrowDataType::Int32,
+            PrimitiveType::Long => ArrowDataType::Int64,
+            PrimitiveType::Float => ArrowDataType::Float32,
+            PrimitiveType::Double => ArrowDataType::Float64,
+            PrimitiveType::Date => ArrowDataType::Date32,
+            PrimitiveType::Time => ArrowDataType::Time64(ArrowTimeUnit::Microsecond),
+            PrimitiveType::Timestamp => ArrowDataType::Timestamp(ArrowTimeUnit::Microsecond, None),
+            PrimitiveType::Timestamptz => {
+                // When converting from Timestamptz, a timezone string is required for Arrow.
+                // "UTC" is a common default if no specific timezone information is available.
+                ArrowDataType::Timestamp(ArrowTimeUnit::Microsecond, Some("UTC".into()))
+            }
+            PrimitiveType::TimestampNs => ArrowDataType::Timestamp(ArrowTimeUnit::Nanosecond, None),
+            PrimitiveType::TimestamptzNs => {
+                // Similar to Timestamptz, provide a default timezone for nanosecond precision.
+                ArrowDataType::Timestamp(ArrowTimeUnit::Nanosecond, Some("UTC".into()))
+            }
+            PrimitiveType::String => ArrowDataType::Utf8,
+            PrimitiveType::Binary => ArrowDataType::Binary,
+            PrimitiveType::Fixed(len) => ArrowDataType::FixedSizeBinary(len as i32),
+            PrimitiveType::Decimal { precision, scale } => {
+                // Cast precision to i32 and scale to i8 as required by ArrowDataType::Decimal128
+                ArrowDataType::Decimal128(precision as u8, scale as i8)
+            }
+            PrimitiveType::Uuid => {
+                // UUIDs are typically represented as FixedSizeBinary(16) in Arrow.
+                // However, Arrow also has a specific 'UuidType' extension type,
+                // but direct conversion from PrimitiveType to ArrowDataType usually
+                // maps to the underlying storage type unless specific metadata
+                // is available for extension types. For simplicity and direct
+                // reversibility of the provided TryFrom, we map it to FixedSizeBinary.
+                ArrowDataType::FixedSizeBinary(16)
+            } // Note: Other PrimitiveType variants like Struct, List, Map
+              // are not directly covered by the provided TryFrom<ArrowDataType> for PrimitiveType,
+              // as they often require more complex conversions or are composite types.
+              // This implementation focuses on the direct reversal of the provided primitive type mappings.
+        }
+    }
+}
+
 impl Serialize for Type {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where S: Serializer {
