@@ -31,7 +31,7 @@ use crate::scan::{
 };
 use crate::spec::{
     DataContentType, ManifestContentType, ManifestEntryRef, ManifestFile, ManifestList,
-    ManifestStatus, Operation, SchemaRef, SnapshotRef, TableMetadataRef,
+    ManifestStatus, Operation, PartitionSpecRef, SchemaRef, SnapshotRef, TableMetadataRef,
 };
 use crate::utils::ancestors_between;
 use crate::{Error, ErrorKind, Result};
@@ -52,6 +52,17 @@ pub(crate) struct ManifestFileContext {
     delete_file_index: DeleteFileIndex,
     case_sensitive: bool,
 
+    /// The partition spec referenced by `manifest_file.partition_spec_id`,
+    /// resolved from `TableMetadata::partition_spec_by_id` at the time the
+    /// scan plan was built. Carried through to each emitted [`FileScanTask`]
+    /// so the Arrow reader can backfill identity-transformed virtual
+    /// partition columns from manifest entry values rather than reading them
+    /// (as NULL) from data files that don't physically carry the column.
+    /// `None` when the manifest references a partition spec id that is not
+    /// present in `TableMetadata` — defensive against stale catalog state;
+    /// the reader degrades gracefully to its pre-fix behavior in that case.
+    partition_spec: Option<PartitionSpecRef>,
+
     /// filter manifest entries.
     /// Used for different kind of scans, e.g., only scan newly added files without delete files.
     filter_fn: Option<Arc<ManifestEntryFilterFn>>,
@@ -66,6 +77,10 @@ pub(crate) struct ManifestEntryContext {
     pub field_ids: Arc<Vec<i32>>,
     pub bound_predicates: Option<Arc<BoundPredicates>>,
     pub partition_spec_id: i32,
+    /// Resolved partition spec corresponding to `partition_spec_id`. See the
+    /// matching field on [`ManifestFileContext`] for rationale; this is the
+    /// per-entry hand-off used by [`Self::into_file_scan_task`].
+    pub partition_spec: Option<PartitionSpecRef>,
     pub snapshot_schema: SchemaRef,
     pub delete_file_index: DeleteFileIndex,
     pub case_sensitive: bool,
@@ -85,6 +100,7 @@ impl ManifestFileContext {
             expression_evaluator_cache,
             delete_file_index,
             case_sensitive,
+            partition_spec,
             filter_fn,
         } = self;
         let filter_fn = filter_fn.unwrap_or_else(|| Arc::new(|_| true));
@@ -98,6 +114,7 @@ impl ManifestFileContext {
                 expression_evaluator_cache: expression_evaluator_cache.clone(),
                 field_ids: field_ids.clone(),
                 partition_spec_id: manifest_file.partition_spec_id,
+                partition_spec: partition_spec.clone(),
                 bound_predicates: bound_predicates.clone(),
                 snapshot_schema: snapshot_schema.clone(),
                 delete_file_index: delete_file_index.clone(),
@@ -144,10 +161,17 @@ impl ManifestEntryContext {
 
             deletes,
 
-            // Include partition data and spec from manifest entry
+            // Include partition data and spec from manifest entry. Both are
+            // load-bearing for the Arrow reader's `with_partition` path
+            // (`crates/iceberg/src/arrow/reader.rs`): identity-transformed
+            // partition fields whose source column is missing from the data
+            // file (the cohort `product_name` virtual-partition pattern in
+            // auguria-io's writer) get their values from the manifest entry's
+            // partition struct rather than reading NULL out of parquet.
+            // Without `partition_spec`, the reader can't tell which projected
+            // fields are eligible for that constant-injection path.
             partition: Some(self.manifest_entry.data_file.partition.clone()),
-            // TODO: Pass actual PartitionSpec through context chain for native flow
-            partition_spec: None,
+            partition_spec: self.partition_spec,
             // TODO: Extract name_mapping from table metadata property "schema.name-mapping.default"
             name_mapping: None,
             case_sensitive: self.case_sensitive,
@@ -347,6 +371,18 @@ impl PlanContext {
                 None
             };
 
+        // Resolve the partition spec referenced by this manifest file so the
+        // reader can inject identity-transformed virtual partition column
+        // values from manifest entries (see the doc on
+        // `ManifestFileContext::partition_spec`). `partition_spec_by_id`
+        // returns `None` only if the catalog and manifest disagree about
+        // which spec ids exist — defensively fall through with `None` and
+        // let the reader behave as it did pre-fix in that case.
+        let partition_spec = self
+            .table_metadata
+            .partition_spec_by_id(manifest_file.partition_spec_id)
+            .cloned();
+
         ManifestFileContext {
             manifest_file: manifest_file.clone(),
             bound_predicates,
@@ -357,6 +393,7 @@ impl PlanContext {
             expression_evaluator_cache: self.expression_evaluator_cache.clone(),
             delete_file_index,
             case_sensitive: self.case_sensitive,
+            partition_spec,
             filter_fn,
         }
     }

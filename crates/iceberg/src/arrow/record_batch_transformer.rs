@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::{
@@ -223,18 +223,40 @@ impl RecordBatchTransformerBuilder {
     /// Both partition_spec and partition_data must be provided together since the spec defines
     /// which fields are identity-partitioned, and the data provides their constant values.
     /// This method computes the partition constants and merges them into constant_fields.
+    ///
+    /// Per Iceberg spec column projection rule #1
+    /// (<https://iceberg.apache.org/spec/#column-projection>), partition metadata supplies a
+    /// value only when the field is **missing** from the data file. If the parquet already
+    /// carries the column, prefer the parquet value — partition metadata is a fallback,
+    /// not an override. Caller passes the set of field IDs the parquet physically holds (after
+    /// any name-mapping has been applied) via `parquet_field_ids`; identity-partition source
+    /// IDs in that set are skipped here, so they read straight through from parquet.
+    ///
+    /// The "virtual partition column" pattern used by auguria-io's cohort writer
+    /// (`iceberg-writer-lib::register_files` with `schema_with_product_name`, plus
+    /// `iceberg-migrate-from-hive`) relies on this fallback path: the producer never writes
+    /// `product_name` into parquet, only into the manifest entry's partition struct.
+    /// Without manifest-fallback the field reads as NULL, and a downstream rewriter
+    /// (e.g. iceberg-compaction-core's RecordBatchPartitionSplitter) materializes that
+    /// NULL into a partition path of `product_name=null/`, losing the partition value.
     pub(crate) fn with_partition(
         mut self,
         partition_spec: Arc<PartitionSpec>,
         partition_data: Struct,
+        parquet_field_ids: &HashSet<i32>,
     ) -> Result<Self> {
         // Compute partition constants for identity-transformed fields (already returns Datum)
         let partition_constants =
             constants_map(&partition_spec, &partition_data, &self.snapshot_schema)?;
 
-        // Add partition constants to constant_fields
+        // Only add a constant when the source column is genuinely absent from the parquet.
+        // Identity-partitioned fields whose source column IS in the parquet must read from
+        // parquet so e.g. a `WHERE x = 1` predicate can match per-row data, not just the
+        // file's partition value.
         for (field_id, datum) in partition_constants {
-            self.constant_fields.insert(field_id, datum);
+            if !parquet_field_ids.contains(&field_id) {
+                self.constant_fields.insert(field_id, datum);
+            }
         }
 
         Ok(self)
@@ -670,7 +692,7 @@ impl RecordBatchTransformer {
 
 #[cfg(test)]
 mod test {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
     use arrow_array::{
@@ -683,7 +705,7 @@ mod test {
     use crate::arrow::record_batch_transformer::{
         RecordBatchTransformer, RecordBatchTransformerBuilder,
     };
-    use crate::spec::{Literal, NestedField, PrimitiveType, Schema, Struct, Type};
+    use crate::spec::{Literal, NestedField, PrimitiveType, Schema, Struct, Transform, Type};
 
     /// Helper to extract string values from either StringArray or RunEndEncoded<StringArray>
     /// Returns empty string for null values
@@ -1230,7 +1252,7 @@ mod test {
 
         let mut transformer =
             RecordBatchTransformerBuilder::new(snapshot_schema, &projected_field_ids)
-                .with_partition(partition_spec, partition_data)
+                .with_partition(partition_spec, partition_data, &HashSet::new())
                 .expect("Failed to add partition constants")
                 .build();
 
@@ -1351,7 +1373,7 @@ mod test {
 
         let mut transformer =
             RecordBatchTransformerBuilder::new(snapshot_schema, &projected_field_ids)
-                .with_partition(partition_spec, partition_data)
+                .with_partition(partition_spec, partition_data, &HashSet::new())
                 .expect("Failed to add partition constants")
                 .build();
 
@@ -1460,7 +1482,7 @@ mod test {
 
         let mut transformer =
             RecordBatchTransformerBuilder::new(snapshot_schema, &projected_field_ids)
-                .with_partition(partition_spec, partition_data)
+                .with_partition(partition_spec, partition_data, &HashSet::new())
                 .expect("Failed to add partition constants")
                 .build();
 
@@ -1565,7 +1587,7 @@ mod test {
 
         let mut transformer =
             RecordBatchTransformerBuilder::new(snapshot_schema, &projected_field_ids)
-                .with_partition(partition_spec, partition_data)
+                .with_partition(partition_spec, partition_data, &HashSet::new())
                 .expect("Failed to add partition constants")
                 .build();
 
@@ -1659,7 +1681,7 @@ mod test {
         let projected_field_ids = [1, 2];
 
         let mut transformer = RecordBatchTransformerBuilder::new(schema, &projected_field_ids)
-            .with_partition(partition_spec, partition_data)
+            .with_partition(partition_spec, partition_data, &HashSet::new())
             .expect("Should handle null partition values")
             .build();
 
@@ -1684,6 +1706,148 @@ mod test {
         assert!(data_col.is_null(0));
         assert!(data_col.is_null(1));
         assert!(data_col.is_null(2));
+    }
+
+    /// Regression test for auguria-io's "virtual partition column" pattern: an
+    /// identity-partitioned column that lives only in the manifest entry's
+    /// partition struct, never in the parquet itself (used by
+    /// `iceberg-writer-lib::register_files` via `schema_with_product_name` and
+    /// by `iceberg-migrate-from-hive` for in-place add_files migrations).
+    /// Without this fix, a downstream rewriter (iceberg-compaction-core's
+    /// `RecordBatchPartitionSplitter`) reads NULL for the column and writes
+    /// new files at `<col>=null/` paths, losing the partition value.
+    #[tokio::test]
+    async fn test_virtual_partition_column_uses_manifest_value() {
+        // Schema has 2 fields: id (in parquet) + product_name (NOT in parquet).
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(
+                        2,
+                        "product_name",
+                        Type::Primitive(PrimitiveType::String),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let partition_spec = Arc::new(
+            crate::spec::PartitionSpec::builder(schema.clone())
+                .with_spec_id(0)
+                .add_partition_field("product_name", "product_name", Transform::Identity)
+                .unwrap()
+                .build()
+                .unwrap(),
+        );
+
+        let partition_data = Struct::from_iter(vec![Some(Literal::string("cisco_meraki_events"))]);
+
+        // Parquet has only `id` — `product_name` is NOT in the file.
+        let file_schema = Arc::new(ArrowSchema::new(vec![simple_field(
+            "id",
+            DataType::Int32,
+            true,
+            "1",
+        )]));
+
+        // `parquet_field_ids` reports only field id 1 (`id`); field id 2
+        // (`product_name`) is missing → must fall back to manifest constant.
+        let parquet_field_ids: HashSet<i32> = [1].into_iter().collect();
+
+        let projected_field_ids = [1, 2];
+
+        let mut transformer = RecordBatchTransformerBuilder::new(schema, &projected_field_ids)
+            .with_partition(partition_spec, partition_data, &parquet_field_ids)
+            .expect("with_partition should accept the virtual column path")
+            .build();
+
+        let file_batch = RecordBatch::try_new(
+            file_schema,
+            vec![Arc::new(Int32Array::from(vec![10, 20, 30]))],
+        )
+        .unwrap();
+
+        let result = transformer.process_record_batch(file_batch).unwrap();
+        assert_eq!(result.num_columns(), 2);
+        assert_eq!(result.num_rows(), 3);
+
+        // `id` reads through from parquet.
+        let id_col = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(id_col.values(), &[10, 20, 30]);
+
+        // `product_name` materializes the manifest value across all rows.
+        // The transformer encodes constants as RunEndEncoded for efficiency.
+        let pn_col = result.column(1);
+        let extracted = get_string_value(pn_col, 0);
+        assert_eq!(extracted, "cisco_meraki_events");
+        assert_eq!(get_string_value(pn_col, 1), "cisco_meraki_events");
+        assert_eq!(get_string_value(pn_col, 2), "cisco_meraki_events");
+    }
+
+    /// Regression test mirror: when the parquet *does* carry the
+    /// identity-partitioned column, prefer parquet values over the manifest
+    /// constant. Verifies the `parquet_field_ids` filter in `with_partition`
+    /// — without it, `WHERE x = 1` would match every row of every file
+    /// regardless of per-row data.
+    #[tokio::test]
+    async fn test_partition_column_prefers_parquet_when_present() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "x", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let partition_spec = Arc::new(
+            crate::spec::PartitionSpec::builder(schema.clone())
+                .with_spec_id(0)
+                .add_partition_field("x", "x", Transform::Identity)
+                .unwrap()
+                .build()
+                .unwrap(),
+        );
+
+        let partition_data = Struct::from_iter(vec![Some(Literal::int(100))]);
+
+        let file_schema = Arc::new(ArrowSchema::new(vec![simple_field(
+            "x",
+            DataType::Int32,
+            true,
+            "1",
+        )]));
+
+        // `x` (field id 1) IS in the parquet — should NOT be overridden.
+        let parquet_field_ids: HashSet<i32> = [1].into_iter().collect();
+
+        let mut transformer = RecordBatchTransformerBuilder::new(schema, &[1])
+            .with_partition(partition_spec, partition_data, &parquet_field_ids)
+            .unwrap()
+            .build();
+
+        let file_batch = RecordBatch::try_new(
+            file_schema,
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        let result = transformer.process_record_batch(file_batch).unwrap();
+        let x_col = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(x_col.values(), &[1, 2, 3]);
     }
 
     // -----------------------------------------------------------------------

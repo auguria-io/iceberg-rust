@@ -340,8 +340,26 @@ impl ArrowReader {
         if let (Some(partition_spec), Some(partition_data)) =
             (task.partition_spec.clone(), task.partition.clone())
         {
-            record_batch_transformer_builder =
-                record_batch_transformer_builder.with_partition(partition_spec, partition_data)?;
+            // Per Iceberg "Column Projection" rule #1: partition metadata is the
+            // fallback for fields *missing* from the data file. Surface the set of
+            // field IDs that ARE in the parquet (post-name-mapping) so the
+            // transformer skips them. Without this filter, an identity-partitioned
+            // column that *is* in parquet would be served as a per-batch constant
+            // sourced from the manifest entry, breaking row-level predicate
+            // evaluation.
+            let parquet_field_ids: HashSet<i32> = match build_field_id_map(
+                record_batch_stream_builder.parquet_schema(),
+            )? {
+                Some(map) => map.keys().copied().collect(),
+                None => build_fallback_field_id_map(
+                    record_batch_stream_builder.parquet_schema(),
+                )
+                .keys()
+                .copied()
+                .collect(),
+            };
+            record_batch_transformer_builder = record_batch_transformer_builder
+                .with_partition(partition_spec, partition_data, &parquet_field_ids)?;
         }
 
         let mut record_batch_transformer = record_batch_transformer_builder.build();
