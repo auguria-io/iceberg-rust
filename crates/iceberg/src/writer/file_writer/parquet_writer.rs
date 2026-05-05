@@ -20,6 +20,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use arrow_array::{ArrayRef, RecordBatch};
+use arrow_cast::cast;
 use arrow_schema::SchemaRef as ArrowSchemaRef;
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -106,6 +108,7 @@ impl FileWriterBuilder for ParquetWriterBuilder {
         Ok(ParquetWriter {
             schema: self.schema.clone(),
             inner_writer: None,
+            arrow_schema: None,
             writer_properties: self.props.clone(),
             current_row_num: 0,
             output_file,
@@ -237,6 +240,14 @@ pub struct ParquetWriter {
     schema: SchemaRef,
     output_file: OutputFile,
     inner_writer: Option<AsyncArrowWriter<AsyncFileWriter>>,
+    /// Lazily-initialized Arrow schema derived from `schema`, with the Iceberg
+    /// schema JSON embedded under [`ICEBERG_SCHEMA_KEY`]. Built once on the
+    /// first `write()` call and reused thereafter — needed both to construct
+    /// the inner `AsyncArrowWriter` and to normalize each input batch's
+    /// columns to the declared parquet types before write (decoding
+    /// `RunEndEncoded` / `Dictionary` constants from upstream pipelines that
+    /// the strict parquet writer would otherwise reject as type mismatches).
+    arrow_schema: Option<ArrowSchemaRef>,
     writer_properties: WriterProperties,
     current_row_num: usize,
     nan_value_count_visitor: NanValueCountVisitor,
@@ -510,23 +521,44 @@ impl FileWriter for ParquetWriter {
         self.nan_value_count_visitor
             .compute(self.schema.clone(), batch_c)?;
 
+        // Materialize the Arrow schema once on first write — needed both to
+        // construct the inner writer AND to normalize each batch's column
+        // encodings before write.
+        let arrow_schema: ArrowSchemaRef = if let Some(cached) = &self.arrow_schema {
+            cached.clone()
+        } else {
+            let mut schema: arrow_schema::Schema = self.schema.as_ref().try_into()?;
+            // Embed the Iceberg schema JSON in the Arrow schema metadata so it
+            // is written into the Parquet `ARROW:schema` IPC section. Some
+            // downstream readers (e.g. Snowflake) expect the `iceberg.schema`
+            // key here in addition to the Parquet footer key-value metadata.
+            let iceberg_schema_json = serde_json::to_string(self.schema.as_ref())
+                .expect("Iceberg schema serialization should not fail");
+            let mut metadata = schema.metadata.clone();
+            metadata.insert(ICEBERG_SCHEMA_KEY.to_string(), iceberg_schema_json);
+            schema.metadata = metadata;
+            let built = Arc::new(schema);
+            self.arrow_schema = Some(built.clone());
+            built
+        };
+
+        // Normalize each batch column to its declared parquet-schema type
+        // before handing to AsyncArrowWriter. parquet-rs requires column
+        // encodings to match the writer's arrow schema exactly, so a batch
+        // produced upstream with non-canonical encodings (RunEndEncoded
+        // constants from the read-side virtual-partition fix at
+        // `crates/iceberg/src/arrow/record_batch_transformer.rs:660-670`,
+        // or Dictionary intermediates from a DataFusion plan) trips a hard
+        // type-mismatch error inside the writer. `arrow_cast::cast` is the
+        // canonical primitive: passthrough when types match, decode for
+        // REE/Dictionary → flat, loud failure (Result) for genuinely
+        // incompatible types — no silent NULL coercion.
+        let normalized_batch = normalize_batch_to_schema(batch, &arrow_schema)?;
+
         // Lazy initialize the writer
         let writer = if let Some(writer) = &mut self.inner_writer {
             writer
         } else {
-            let arrow_schema: ArrowSchemaRef = {
-                let mut schema: arrow_schema::Schema = self.schema.as_ref().try_into()?;
-                // Embed the Iceberg schema JSON in the Arrow schema metadata so it
-                // is written into the Parquet `ARROW:schema` IPC section. Some
-                // downstream readers (e.g. Snowflake) expect the `iceberg.schema`
-                // key here in addition to the Parquet footer key-value metadata.
-                let iceberg_schema_json = serde_json::to_string(self.schema.as_ref())
-                    .expect("Iceberg schema serialization should not fail");
-                let mut metadata = schema.metadata.clone();
-                metadata.insert(ICEBERG_SCHEMA_KEY.to_string(), iceberg_schema_json);
-                schema.metadata = metadata;
-                Arc::new(schema)
-            };
             let inner_writer = self.output_file.writer().await?;
             let async_writer = AsyncFileWriter::new(inner_writer);
             let writer = AsyncArrowWriter::try_new(
@@ -542,7 +574,7 @@ impl FileWriter for ParquetWriter {
             self.inner_writer.as_mut().unwrap()
         };
 
-        writer.write(batch).await.map_err(|err| {
+        writer.write(&normalized_batch).await.map_err(|err| {
             Error::new(
                 ErrorKind::Unexpected,
                 "Failed to write using parquet writer.",
@@ -609,6 +641,84 @@ impl CurrentFileStatus for ParquetWriter {
     }
 }
 
+/// Cast each column in `batch` whose data type differs from the matching
+/// position in `target_schema`, returning a new `RecordBatch` whose first
+/// `min(batch_cols, target_fields)` columns carry the target types and
+/// whose remaining columns (if any) pass through unchanged.
+///
+/// Why this exists: the parquet-rs `AsyncArrowWriter` validates each input
+/// column's data type against its declared parquet schema and rejects
+/// mismatches, including ostensibly-equivalent encodings like
+/// `RunEndEncoded(Int32, Utf8)` vs `Utf8`. iceberg-rust's read-side virtual
+/// partition fix produces RunEndEncoded constants for partition-derived
+/// columns, and DataFusion plans can introduce Dictionary intermediates;
+/// both must be decoded to flat before write. `arrow_cast::cast` handles
+/// all of this loudly — passthrough on match, decode on REE/Dictionary,
+/// `Result::Err` on genuine incompatibility (no silent NULL coercion).
+///
+/// The pair count is the minimum of the two field lists because the
+/// `RecordBatchPartitionSplitter` precomputed-mode path can append a
+/// synthetic `_partition` column to the batch that is NOT declared by the
+/// parquet writer's schema; downstream stages strip it before the actual
+/// per-column write. Touching only the data-positioned columns preserves
+/// that contract while still normalizing the encodings the writer cares
+/// about.
+fn normalize_batch_to_schema(
+    batch: &RecordBatch,
+    target_schema: &ArrowSchemaRef,
+) -> Result<RecordBatch> {
+    let pair_count = batch
+        .columns()
+        .len()
+        .min(target_schema.fields().len());
+    let mut needs_normalization = false;
+    for i in 0..pair_count {
+        if batch.column(i).data_type() != target_schema.field(i).data_type() {
+            needs_normalization = true;
+            break;
+        }
+    }
+    if !needs_normalization {
+        // Hot path: types already match, no rebuild.
+        return Ok(batch.clone());
+    }
+    let batch_schema = batch.schema();
+    let mut new_fields: Vec<arrow_schema::FieldRef> =
+        Vec::with_capacity(batch_schema.fields().len());
+    let mut new_columns: Vec<ArrayRef> = Vec::with_capacity(batch.columns().len());
+    for i in 0..batch.columns().len() {
+        if i < pair_count
+            && batch.column(i).data_type() != target_schema.field(i).data_type()
+        {
+            let target_field = target_schema.field(i);
+            let cast_col = cast(batch.column(i), target_field.data_type()).map_err(|e| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Failed to cast column '{}' from {:?} to {:?}: {e}",
+                        target_field.name(),
+                        batch.column(i).data_type(),
+                        target_field.data_type(),
+                    ),
+                )
+            })?;
+            new_columns.push(cast_col);
+            new_fields.push(Arc::new(target_field.clone()));
+        } else {
+            new_columns.push(batch.column(i).clone());
+            new_fields.push(batch_schema.fields()[i].clone());
+        }
+    }
+    let new_schema = Arc::new(arrow_schema::Schema::new(new_fields));
+    RecordBatch::try_new(new_schema, new_columns).map_err(|err| {
+        Error::new(
+            ErrorKind::DataInvalid,
+            "Failed to construct normalized RecordBatch",
+        )
+        .with_source(err)
+    })
+}
+
 /// AsyncFileWriter is a wrapper of FileWrite to make it compatible with tokio::io::AsyncWrite.
 ///
 /// # NOTES
@@ -653,7 +763,7 @@ mod tests {
     use arrow_array::types::{Float32Type, Int64Type};
     use arrow_array::{
         Array, ArrayRef, BooleanArray, Decimal128Array, Float32Array, Float64Array, Int32Array,
-        Int64Array, ListArray, MapArray, RecordBatch, StructArray,
+        Int64Array, ListArray, MapArray, RecordBatch, StringArray, StructArray,
     };
     use arrow_schema::{DataType, Field, Fields, SchemaRef as ArrowSchemaRef};
     use arrow_select::concat::concat_batches;
@@ -1654,6 +1764,101 @@ mod tests {
         pw.close().await.unwrap();
         assert!(!file_io.exists(&file_path).await.unwrap());
 
+        Ok(())
+    }
+
+    /// Regression for Fix 3 of plan-42 Task 7. The read-side virtual-partition
+    /// fix (`crates/iceberg/src/arrow/record_batch_transformer.rs:660-670`)
+    /// emits identity-partition manifest values as `RunEndEncoded` constants.
+    /// When such a batch flows downstream into the parquet writer (e.g. the
+    /// iceberg-compaction-core compactor's read→split→write pipeline against
+    /// a migrated cohort table), the writer must accept the REE encoding and
+    /// decode to the canonical flat type declared by the parquet schema —
+    /// not reject it as a hard type mismatch like `arrow_array`'s strict
+    /// validation does by default.
+    #[tokio::test]
+    async fn test_parquet_writer_decodes_run_end_encoded_input() -> Result<()> {
+        use arrow_array::RunArray;
+        use arrow_array::types::Int32Type;
+
+        let temp_dir = TempDir::new().unwrap();
+        let file_io = FileIOBuilder::new_fs_io().build().unwrap();
+        let location_gen = DefaultLocationGenerator::with_data_location(
+            temp_dir.path().to_str().unwrap().to_string(),
+        );
+        let file_name_gen = DefaultFileNameGenerator::new(
+            "ree_input".to_string(),
+            None,
+            DataFileFormat::Parquet,
+        );
+
+        // Iceberg schema declares `product_name` as canonical Utf8.
+        let iceberg_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(0)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(
+                        2,
+                        "product_name",
+                        Type::Primitive(PrimitiveType::String),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        // Build an input batch with `product_name` as a RunEndEncoded constant
+        // (one run, three logical rows, value "cisco_meraki_events"), matching
+        // the shape produced by the read-side virtual-partition fix.
+        let run_ends = Int32Array::from(vec![3]);
+        let values = StringArray::from(vec!["cisco_meraki_events"]);
+        let ree_array: ArrayRef =
+            Arc::new(RunArray::<Int32Type>::try_new(&run_ends, &values).unwrap());
+
+        let arrow_schema_in = Arc::new(arrow_schema::Schema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+            Field::new("product_name", ree_array.data_type().clone(), true).with_metadata(
+                HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "2".to_string())]),
+            ),
+        ]));
+        let id_col = Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef;
+        let to_write =
+            RecordBatch::try_new(arrow_schema_in, vec![id_col, ree_array]).unwrap();
+
+        let file_path =
+            location_gen.generate_location(None, &file_name_gen.generate_file_name());
+        let output_file = file_io.new_output(&file_path)?;
+        let mut pw =
+            ParquetWriterBuilder::new(WriterProperties::builder().build(), iceberg_schema)
+                .build(output_file)
+                .await?;
+        pw.write(&to_write).await?;
+        let _data_files = pw.close().await?;
+
+        // Read back via the sync parquet reader and assert the values flow
+        // through — the writer should have decoded REE to flat Utf8 instead
+        // of erroring at write time.
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        let file = std::fs::File::open(&file_path)?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+        let batches: std::result::Result<Vec<_>, _> = reader.collect();
+        let batches = batches?;
+        let read_batch = concat_batches(&batches[0].schema(), &batches)?;
+        assert_eq!(read_batch.num_rows(), 3);
+        let str_arr = read_batch
+            .column_by_name("product_name")
+            .expect("product_name column missing in read-back parquet")
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .expect("product_name should read back as flat StringArray, not REE");
+        assert_eq!(str_arr.value(0), "cisco_meraki_events");
+        assert_eq!(str_arr.value(1), "cisco_meraki_events");
+        assert_eq!(str_arr.value(2), "cisco_meraki_events");
         Ok(())
     }
 
