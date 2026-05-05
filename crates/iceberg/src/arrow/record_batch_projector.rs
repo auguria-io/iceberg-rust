@@ -34,6 +34,14 @@ pub struct RecordBatchProjector {
     // E.g. [[0], [1, 2]] means the first field is accessed directly from the first column,
     // while the second field is accessed from the second column and then from its third subcolumn (second column must be a struct column).
     field_indices: Vec<Vec<usize>>,
+    // The Iceberg field IDs being projected, in projection order. Carried so
+    // `project_record_batch` can locate columns by `PARQUET_FIELD_ID_META_KEY`
+    // metadata at call time rather than relying solely on the construction-time
+    // positional `field_indices` cache. Defends against top-level column
+    // reordering between read and projection (e.g. DataFusion plan rewrites in
+    // the compactor path between iceberg-rust's reader and the partition
+    // splitter). Empty when constructed via `new` without explicit field IDs.
+    target_field_ids: Vec<i64>,
     // The schema reference after projection. This schema is derived from the original schema based on the given field IDs.
     projected_schema: SchemaRef,
 }
@@ -57,6 +65,7 @@ impl RecordBatchProjector {
     {
         let mut field_indices = Vec::with_capacity(field_ids.len());
         let mut fields = Vec::with_capacity(field_ids.len());
+        let mut target_field_ids = Vec::with_capacity(field_ids.len());
         for &id in field_ids {
             let mut field_index = vec![];
             let field = Self::fetch_field_index(
@@ -72,10 +81,12 @@ impl RecordBatchProjector {
             })?;
             fields.push(field.clone());
             field_indices.push(field_index);
+            target_field_ids.push(id as i64);
         }
         let delete_arrow_schema = Arc::new(Schema::new(fields));
         Ok(Self {
             field_indices,
+            target_field_ids,
             projected_schema: delete_arrow_schema,
         })
     }
@@ -161,21 +172,103 @@ impl RecordBatchProjector {
         &self.projected_schema
     }
 
-    /// Do projection with record batch
+    /// Do projection with record batch.
+    ///
+    /// Prefers locating each target field by its `PARQUET_FIELD_ID_META_KEY`
+    /// metadata in the input batch's schema (defends against top-level column
+    /// reordering between construction and call — e.g. DataFusion plan
+    /// rewrites in the compactor path). Falls back to the construction-time
+    /// cached positional indices when the input batch lacks field-id metadata
+    /// (back-compat for callers that build batches without it, and the only
+    /// path that handles nested struct fields today).
     pub(crate) fn project_batch(&self, batch: RecordBatch) -> Result<RecordBatch> {
         RecordBatch::try_new(
             self.projected_schema.clone(),
-            self.project_column(batch.columns())?,
+            self.project_record_batch(&batch)?,
         )
         .map_err(|err| Error::new(ErrorKind::DataInvalid, format!("{err}")))
     }
 
-    /// Do projection with columns
+    /// Project columns from a `RecordBatch`, locating each target field by its
+    /// `PARQUET_FIELD_ID_META_KEY` metadata in the batch schema when present,
+    /// falling back to the construction-time cached positional indices when
+    /// not. See [`project_batch`](Self::project_batch) for the rationale.
+    pub fn project_record_batch(&self, batch: &RecordBatch) -> Result<Vec<ArrayRef>> {
+        // Build a top-level field-id → column-index map from the input batch's
+        // schema. Empty when no field carries the metadata key, in which case
+        // every lookup falls back to the cached positional path.
+        let id_to_top_level_idx = Self::build_top_level_field_id_index(batch.schema_ref())?;
+
+        self.field_indices
+            .iter()
+            .enumerate()
+            .map(|(projection_idx, cached_path)| {
+                // Prefer metadata-driven lookup at the top level. Only the
+                // top level is metadata-aware here; nested struct fields
+                // continue to use cached positional traversal because the
+                // existing nesting algorithm assumes positional stability
+                // and no production caller exercises nested-virtual-partition
+                // patterns today. Generalizing to nested metadata lookup is
+                // tracked separately.
+                let target_id = self.target_field_ids.get(projection_idx).copied();
+                if cached_path.len() == 1
+                    && let Some(id) = target_id
+                {
+                    if let Some(&top_level_idx) = id_to_top_level_idx.get(&id) {
+                        return Self::get_column_by_field_index(batch.columns(), &[top_level_idx]);
+                    }
+                    // If the input batch carries field-id metadata for at
+                    // least some columns but doesn't carry the target id,
+                    // surface an explicit error rather than silently falling
+                    // back to a positional index that would grab the wrong
+                    // column. A batch with no metadata at all
+                    // (id_to_top_level_idx empty) keeps the positional
+                    // fallback for back-compat with non-iceberg callers.
+                    if !id_to_top_level_idx.is_empty() {
+                        return Err(Error::new(
+                            ErrorKind::DataInvalid,
+                            "Target field id not present in batch metadata",
+                        )
+                        .with_context("field_id", id.to_string()));
+                    }
+                }
+                Self::get_column_by_field_index(batch.columns(), cached_path)
+            })
+            .collect::<Result<Vec<_>>>()
+    }
+
+    /// Do projection with columns (positional only; no metadata lookup).
+    ///
+    /// Retained for back-compat with callers that don't have a `RecordBatch`
+    /// in scope. Prefer [`project_record_batch`](Self::project_record_batch)
+    /// when a `RecordBatch` is available — it adds top-level field-id metadata
+    /// resolution on top of the same positional path.
     pub fn project_column(&self, batch: &[ArrayRef]) -> Result<Vec<ArrayRef>> {
         self.field_indices
             .iter()
             .map(|index_vec| Self::get_column_by_field_index(batch, index_vec))
             .collect::<Result<Vec<_>>>()
+    }
+
+    /// Walk the top-level fields of `schema` and build a map from
+    /// `PARQUET_FIELD_ID_META_KEY` value to column index. Fields without the
+    /// metadata key are skipped. Returns an empty map when no field carries
+    /// the metadata.
+    fn build_top_level_field_id_index(
+        schema: &SchemaRef,
+    ) -> Result<std::collections::HashMap<i64, usize>> {
+        let mut map = std::collections::HashMap::new();
+        for (idx, field) in schema.fields().iter().enumerate() {
+            if let Some(value) = field.metadata().get(PARQUET_FIELD_ID_META_KEY) {
+                let id = value.parse::<i64>().map_err(|e| {
+                    Error::new(ErrorKind::DataInvalid, "Failed to parse field id")
+                        .with_context("value", value)
+                        .with_source(e)
+                })?;
+                map.insert(id, idx);
+            }
+        }
+        Ok(map)
     }
 
     fn get_column_by_field_index(batch: &[ArrayRef], field_index: &[usize]) -> Result<ArrayRef> {
@@ -356,5 +449,155 @@ mod test {
         assert_eq!(projector.projected_schema_ref().fields().len(), 2);
         assert_eq!(projector.projected_schema_ref().field(0).name(), "id");
         assert_eq!(projector.projected_schema_ref().field(1).name(), "age");
+    }
+
+    /// Regression for Fix 2 of plan-42 Task 7. When the input batch's columns
+    /// are reordered relative to the construction-time iceberg schema (the
+    /// shape produced by DataFusion plan rewrites in the compactor path),
+    /// `project_record_batch` must locate columns by field-id metadata, not
+    /// by cached positional index. Pre-Fix-2 this would silently grab the
+    /// wrong column.
+    #[test]
+    fn test_project_record_batch_locates_columns_by_field_id_after_reorder() {
+        use std::collections::HashMap;
+        use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+
+        let iceberg_schema = IcebergSchema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::required(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::optional(3, "age", Type::Primitive(PrimitiveType::Int)).into(),
+            ])
+            .build()
+            .unwrap();
+
+        let projector =
+            RecordBatchProjector::from_iceberg_schema(Arc::new(iceberg_schema), &[1, 3]).unwrap();
+
+        // Construct an input batch where columns are in REVERSE iceberg
+        // schema order (age, name, id), each carrying its iceberg field id
+        // as parquet metadata. The cached positional indices say
+        // [0]=field_id_1=id, [2]=field_id_3=age — applied positionally to
+        // this reordered batch they would return age at slot 0 and ... an
+        // out-of-bounds at slot 2 (only 3 cols). Field-id metadata lookup
+        // must instead return id from idx 2 and age from idx 0.
+        let with_id = |name: &str, dt: DataType, nullable: bool, id: i32| {
+            Field::new(name, dt, nullable).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                id.to_string(),
+            )]))
+        };
+        let arrow_schema = Arc::new(Schema::new(vec![
+            with_id("age", DataType::Int32, true, 3),
+            with_id("name", DataType::Utf8, false, 2),
+            with_id("id", DataType::Int32, false, 1),
+        ]));
+        let batch = RecordBatch::try_new(arrow_schema, vec![
+            Arc::new(Int32Array::from(vec![Some(40), Some(50), Some(60)])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+        ])
+        .unwrap();
+
+        let projected = projector.project_record_batch(&batch).unwrap();
+        assert_eq!(projected.len(), 2);
+
+        let id_col = projected[0].as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(id_col.values(), &[1, 2, 3]);
+
+        let age_col = projected[1].as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(age_col.value(0), 40);
+        assert_eq!(age_col.value(1), 50);
+        assert_eq!(age_col.value(2), 60);
+    }
+
+    /// Pin against silent grab-the-wrong-column when a metadata-tagged batch
+    /// is missing a target field id entirely (partial projection). The
+    /// projector must surface an explicit error instead of falling back to a
+    /// positional index that could collide with an unrelated column.
+    #[test]
+    fn test_project_record_batch_errors_on_missing_field_id_in_tagged_batch() {
+        use std::collections::HashMap;
+        use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+
+        let iceberg_schema = IcebergSchema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::required(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::optional(3, "age", Type::Primitive(PrimitiveType::Int)).into(),
+            ])
+            .build()
+            .unwrap();
+
+        let projector =
+            RecordBatchProjector::from_iceberg_schema(Arc::new(iceberg_schema), &[1, 3]).unwrap();
+
+        // Batch has only fields 1 and 2 — field 3 (age) is absent. Metadata
+        // is present, so we must NOT positional-fallback to slot [2] (which
+        // would either OOB or grab a wrong column).
+        let with_id = |name: &str, dt: DataType, nullable: bool, id: i32| {
+            Field::new(name, dt, nullable).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                id.to_string(),
+            )]))
+        };
+        let arrow_schema = Arc::new(Schema::new(vec![
+            with_id("id", DataType::Int32, false, 1),
+            with_id("name", DataType::Utf8, false, 2),
+        ]));
+        let batch = RecordBatch::try_new(arrow_schema, vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef,
+        ])
+        .unwrap();
+
+        let err = projector.project_record_batch(&batch).unwrap_err();
+        assert!(
+            err.to_string().contains("Target field id not present"),
+            "expected explicit error about missing field id, got: {err}"
+        );
+    }
+
+    /// Pin the back-compat positional fallback for batches that don't carry
+    /// any field-id metadata. The projector falls back to the
+    /// construction-time cached positional indices in this case (the path
+    /// existing non-iceberg callers depend on).
+    #[test]
+    fn test_project_record_batch_falls_back_to_positional_when_no_metadata() {
+        let iceberg_schema = IcebergSchema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::required(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::optional(3, "age", Type::Primitive(PrimitiveType::Int)).into(),
+            ])
+            .build()
+            .unwrap();
+
+        let projector =
+            RecordBatchProjector::from_iceberg_schema(Arc::new(iceberg_schema), &[1, 3]).unwrap();
+
+        // Batch in iceberg-schema order, NO field-id metadata. Cached
+        // positional path should still work — id at slot 0, age at slot 2.
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("age", DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(arrow_schema, vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![Some(40), Some(50), Some(60)])) as ArrayRef,
+        ])
+        .unwrap();
+
+        let projected = projector.project_record_batch(&batch).unwrap();
+        let id_col = projected[0].as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(id_col.values(), &[1, 2, 3]);
+        let age_col = projected[1].as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(age_col.value(0), 40);
+        assert_eq!(age_col.value(2), 60);
     }
 }

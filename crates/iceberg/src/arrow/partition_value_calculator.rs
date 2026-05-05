@@ -134,8 +134,13 @@ impl PartitionValueCalculator {
     /// - Transform application fails
     /// - StructArray construction fails
     pub fn calculate(&self, batch: &RecordBatch) -> Result<ArrayRef> {
-        // Project source columns from the batch
-        let source_columns = self.projector.project_column(batch.columns())?;
+        // Project source columns from the batch. Prefer metadata-driven
+        // lookup (`PARQUET_FIELD_ID_META_KEY`) over the projector's cached
+        // positional indices — defends against top-level column reordering
+        // between the iceberg-rust reader and the splitter (e.g. DataFusion
+        // plan rewrites in the compactor path). Falls back to positional
+        // indexing when the input batch lacks field-id metadata.
+        let source_columns = self.projector.project_record_batch(batch)?;
 
         // Get expected struct fields for the result
         let expected_struct_fields = match &self.partition_arrow_type {
