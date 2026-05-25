@@ -400,21 +400,22 @@ impl RecordBatchTransformer {
                                 )]));
                         Ok(Arc::new(arrow_field))
                     } else {
-                        // This is a partition constant field (exists in schema but uses constant value)
-                        let field = &field_id_to_mapped_schema_map
+                        // Identity-partition constant field: it exists in the
+                        // table schema, so its Arrow output type MUST be the
+                        // canonical schema type (e.g. Utf8) — never a synthetic
+                        // RunEndEncoded type. Files that physically carry the
+                        // column emit the flat type via PassThrough; if backfilled
+                        // files emitted RunEndEncoded instead, the per-file output
+                        // schemas would diverge and a downstream cross-file
+                        // concat/union (DataFusion compaction) fails with
+                        // `concat(Utf8, RunEndEncoded(Utf8))` (plan-46 Task 7,
+                        // observed on golden `…cisco_asa`). Returning the canonical
+                        // field keeps every file's output schema identical.
+                        Ok(field_id_to_mapped_schema_map
                             .get(field_id)
                             .ok_or(Error::new(ErrorKind::Unexpected, "field not found"))?
-                            .0;
-                        let datum = constant_fields.get(field_id).ok_or(Error::new(
-                            ErrorKind::Unexpected,
-                            "constant field not found",
-                        ))?;
-                        let arrow_type = datum_to_arrow_type_with_ree(datum);
-                        // Use the type from constant_fields (REE for constants)
-                        let constant_field =
-                            Field::new(field.name(), arrow_type, field.is_nullable())
-                                .with_metadata(field.metadata().clone());
-                        Ok(Arc::new(constant_field))
+                            .0
+                            .clone())
                     }
                 } else {
                     // Regular field - use schema as-is
@@ -512,10 +513,21 @@ impl RecordBatchTransformer {
                 // they exist in the Parquet file. This is per Iceberg spec rule #1: partition metadata
                 // is authoritative and should be preferred over file data.
                 if let Some(datum) = constant_fields.get(field_id) {
-                    let arrow_type = datum_to_arrow_type_with_ree(datum);
+                    // Mirror the output-schema type chosen in `build_transform`:
+                    // identity-partition constants (present in the table schema)
+                    // use the canonical schema type, so backfilled files concat
+                    // with files that store the column physically (plan-46 Task 7 —
+                    // avoids `concat(Utf8, RunEndEncoded(Utf8))`). Virtual/metadata
+                    // constants (e.g. `_file`, not in the schema) keep
+                    // RunEndEncoded: they are always backfilled, so every file
+                    // agrees, and REE is a real memory win for the repeated value.
+                    let target_type = match field_id_to_mapped_schema_map.get(field_id) {
+                        Some((field, _)) => field.data_type().clone(),
+                        None => datum_to_arrow_type_with_ree(datum),
+                    };
                     return Ok(ColumnSource::Add {
                         value: Some(datum.literal().clone()),
-                        target_type: arrow_type,
+                        target_type,
                     });
                 }
 
@@ -1784,8 +1796,20 @@ mod test {
         assert_eq!(id_col.values(), &[10, 20, 30]);
 
         // `product_name` materializes the manifest value across all rows.
-        // The transformer encodes constants as RunEndEncoded for efficiency.
+        // It is an identity-partition column present in the table schema, so it
+        // must materialize as the canonical flat Utf8 — NOT RunEndEncoded — so a
+        // backfilled file can concat with a file that stores the column physically
+        // (plan-46 Task 7).
         let pn_col = result.column(1);
+        assert_eq!(
+            pn_col.data_type(),
+            &DataType::Utf8,
+            "partition constant must be flat Utf8, not RunEndEncoded, so cross-file concat works"
+        );
+        assert!(
+            pn_col.as_any().downcast_ref::<StringArray>().is_some(),
+            "expected a flat StringArray for the backfilled partition constant"
+        );
         let extracted = get_string_value(pn_col, 0);
         assert_eq!(extracted, "cisco_meraki_events");
         assert_eq!(get_string_value(pn_col, 1), "cisco_meraki_events");
@@ -1848,6 +1872,96 @@ mod test {
             .downcast_ref::<Int32Array>()
             .unwrap();
         assert_eq!(x_col.values(), &[1, 2, 3]);
+    }
+
+    /// plan-46 Task 7 regression: an identity-partition column that is backfilled
+    /// for one file (missing from parquet) and read-through for another (present
+    /// in parquet) must produce the SAME Arrow output schema. Before the fix the
+    /// backfilled file emitted `RunEndEncoded(Utf8)` while the read-through file
+    /// emitted flat `Utf8`, so DataFusion's cross-file concat in the compactor
+    /// panicked with `concat(Utf8, RunEndEncoded(Utf8))` (observed on golden
+    /// `…cisco_asa`). Schema equality across the two files is exactly the
+    /// precondition `concat_batches` enforces.
+    #[tokio::test]
+    async fn test_partition_constant_schema_matches_passthrough() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(
+                        2,
+                        "product_name",
+                        Type::Primitive(PrimitiveType::String),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let partition_spec = Arc::new(
+            crate::spec::PartitionSpec::builder(schema.clone())
+                .with_spec_id(0)
+                .add_partition_field("product_name", "product_name", Transform::Identity)
+                .unwrap()
+                .build()
+                .unwrap(),
+        );
+        let partition_data = Struct::from_iter(vec![Some(Literal::string("cisco_asa_network"))]);
+        let projected_field_ids = [1, 2];
+
+        // File A: product_name MISSING from parquet → backfilled from manifest.
+        let mut transformer_a =
+            RecordBatchTransformerBuilder::new(schema.clone(), &projected_field_ids)
+                .with_partition(
+                    partition_spec.clone(),
+                    partition_data.clone(),
+                    &[1].into_iter().collect(),
+                )
+                .unwrap()
+                .build();
+        let batch_a = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![simple_field(
+                "id",
+                DataType::Int32,
+                true,
+                "1",
+            )])),
+            vec![Arc::new(Int32Array::from(vec![10, 20, 30]))],
+        )
+        .unwrap();
+        let result_a = transformer_a.process_record_batch(batch_a).unwrap();
+
+        // File B: product_name PRESENT in parquet → read through as flat Utf8.
+        let mut transformer_b =
+            RecordBatchTransformerBuilder::new(schema.clone(), &projected_field_ids)
+                .with_partition(partition_spec, partition_data, &[1, 2].into_iter().collect())
+                .unwrap()
+                .build();
+        let batch_b = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                simple_field("id", DataType::Int32, true, "1"),
+                simple_field("product_name", DataType::Utf8, true, "2"),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![40, 50])),
+                Arc::new(StringArray::from(vec![
+                    "cisco_asa_network",
+                    "cisco_asa_network",
+                ])),
+            ],
+        )
+        .unwrap();
+        let result_b = transformer_b.process_record_batch(batch_b).unwrap();
+
+        // Both files must expose product_name as flat Utf8 ...
+        assert_eq!(result_a.column(1).data_type(), &DataType::Utf8);
+        assert_eq!(result_b.column(1).data_type(), &DataType::Utf8);
+        // ... and, crucially, expose IDENTICAL output schemas — the precondition
+        // for DataFusion's cross-file `concat_batches` to succeed in the compactor.
+        // A RunEndEncoded backfill here is exactly what broke compaction on golden.
+        assert_eq!(result_a.schema(), result_b.schema());
     }
 
     // -----------------------------------------------------------------------
