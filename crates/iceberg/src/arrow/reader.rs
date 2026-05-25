@@ -56,7 +56,9 @@ use crate::expr::{BoundPredicate, BoundReference};
 use crate::io::{FileIO, FileMetadata, FileRead};
 use crate::metadata_columns::{RESERVED_FIELD_ID_FILE, is_metadata_field};
 use crate::scan::{ArrowRecordBatchStream, FileScanTask, FileScanTaskStream};
-use crate::spec::{DataContentType, Datum, NameMapping, NestedField, PrimitiveType, Schema, Type};
+use crate::spec::{
+    DataContentType, Datum, NameMapping, NestedField, NestedFieldRef, PrimitiveType, Schema, Type,
+};
 use crate::utils::available_parallelism;
 use crate::{Error, ErrorKind};
 
@@ -269,20 +271,40 @@ impl ArrowReader {
         // - Branch 2: nameMapping present → applyNameMapping(), then pruneColumns()
         // - Branch 3: fallback → addFallbackIds(), then pruneColumnsFallback()
         let mut record_batch_stream_builder = if missing_field_ids {
-            // Parquet file lacks field IDs - must assign them before reading
-            let arrow_schema = if let Some(name_mapping) = &task.name_mapping {
-                // Branch 2: Apply name mapping to assign correct Iceberg field IDs
-                // Per spec rule #2: "Use schema.name-mapping.default metadata to map field id
-                // to columns without field id"
-                // Corresponds to Java's ParquetSchemaUtil.applyNameMapping()
-                apply_name_mapping_to_arrow_schema(
+            // Parquet file lacks field IDs - assign them by NAME before reading.
+            //
+            // Branch 2/3 collapse to a single name-based strategy: use the
+            // table's explicit name mapping when present, otherwise derive one
+            // from the task schema. Name-based resolution is the only correct
+            // option for a file without embedded IDs, because the file's
+            // physical column order may diverge from field-id order — a
+            // schema-evolving writer can omit a column mid-schema and append
+            // later ones. The previous position-based fallback
+            // (`addFallbackIds`: physical column N → field-id N+1) silently
+            // mis-bound columns in that case. Observed on golden
+            // `cisco_asa`: files that omit `product_name` (field-id 22) and
+            // append `auguria_event_timestamp` get physical
+            // `auguria_event_timestamp` at the position where field-id 22 would
+            // be, so positional binding served epoch-millis as the
+            // `product_name` identity-partition value — lossless but silently
+            // corrupt partitioning. Resolving by name binds each physical
+            // column to its real field id and leaves omitted identity-partition
+            // columns to be back-filled from the manifest (rule #1).
+            let arrow_schema = match &task.name_mapping {
+                // Branch 2: explicit table name mapping
+                // (schema.name-mapping.default). Corresponds to Java's
+                // ParquetSchemaUtil.applyNameMapping().
+                Some(name_mapping) => apply_name_mapping_to_arrow_schema(
                     Arc::clone(initial_stream_builder.schema()),
                     name_mapping,
-                )?
-            } else {
-                // Branch 3: No name mapping - use position-based fallback IDs
-                // Corresponds to Java's ParquetSchemaUtil.addFallbackIds()
-                add_fallback_field_ids_to_arrow_schema(initial_stream_builder.schema())
+                )?,
+                // Branch 3: no explicit mapping — assign field ids by NAME from
+                // the task schema, recursing through nested types. Replaces the
+                // unsafe positional `addFallbackIds` path.
+                None => assign_field_ids_by_name(
+                    initial_stream_builder.schema(),
+                    task.schema(),
+                ),
             };
 
             let options = ArrowReaderOptions::new().with_schema(arrow_schema);
@@ -309,16 +331,20 @@ impl ArrowReader {
             .copied()
             .collect();
 
-        // Create projection mask based on field IDs
-        // - If file has embedded IDs: field-ID-based projection (missing_field_ids=false)
-        // - If name mapping applied: field-ID-based projection (missing_field_ids=true but IDs now match)
-        // - If fallback IDs: position-based projection (missing_field_ids=true)
+        // Create projection mask based on field IDs. Projection is always
+        // field-id-based now: either the file carries embedded IDs (Branch 1),
+        // or we assigned them by name above (Branch 2/3) so the builder's
+        // schema (`record_batch_stream_builder.schema()`) carries the correct
+        // IDs in physical-column order. Position-based projection
+        // (`field-id N → column N-1`) is never used in the read path — it
+        // mis-binds columns whenever physical order diverges from field-id
+        // order, the same root cause as the name-mapping change above.
         let projection_mask = Self::get_arrow_projection_mask(
             &project_field_ids_without_metadata,
             &task.schema,
             record_batch_stream_builder.parquet_schema(),
             record_batch_stream_builder.schema(),
-            missing_field_ids, // Whether to use position-based (true) or field-ID-based (false) projection
+            false, // always field-ID-based; IDs are present (embedded or name-assigned)
         )?;
 
         record_batch_stream_builder =
@@ -350,13 +376,25 @@ impl ArrowReader {
             let parquet_field_ids: HashSet<i32> = match build_field_id_map(
                 record_batch_stream_builder.parquet_schema(),
             )? {
+                // File carries embedded field ids — trust them (unchanged).
                 Some(map) => map.keys().copied().collect(),
-                None => build_fallback_field_id_map(
-                    record_batch_stream_builder.parquet_schema(),
-                )
-                .keys()
-                .copied()
-                .collect(),
+                // No embedded ids: the builder's arrow schema now carries the
+                // field ids we assigned BY NAME above (Branch 2/3). Derive the
+                // physically-present set from it rather than from the positional
+                // `build_fallback_field_id_map`. The positional map mis-reported
+                // an out-of-order appended column (e.g. `auguria_event_timestamp`
+                // at the slot of field-id 22) as the partition source field,
+                // which made `with_partition` skip the identity-partition
+                // back-fill and surface a NULL/wrong `product_name`. Name-based
+                // presence keeps genuinely-absent identity columns eligible for
+                // the manifest back-fill (rule #1).
+                None => record_batch_stream_builder
+                    .schema()
+                    .fields()
+                    .iter()
+                    .filter_map(|f| f.metadata().get(PARQUET_FIELD_ID_META_KEY))
+                    .filter_map(|v| v.parse::<i32>().ok())
+                    .collect(),
             };
             record_batch_transformer_builder = record_batch_transformer_builder
                 .with_partition(partition_spec, partition_data, &parquet_field_ids)?;
@@ -1133,42 +1171,97 @@ fn apply_name_mapping_to_arrow_schema(
     )))
 }
 
-/// Add position-based fallback field IDs to Arrow schema for Parquet files lacking them.
-/// Enables projection on migrated files (e.g., from Hive/Spark).
+// NOTE: the former `add_fallback_field_ids_to_arrow_schema` (position-based
+// fallback: physical column N → field-id N+1) was removed in favor of
+// `assign_field_ids_by_name`. Position-based assignment silently mis-binds
+// columns when a file's physical order diverges from field-id order (a
+// schema-evolving writer omitting/appending columns), which is exactly the
+// golden `cisco_asa` corruption plan-46 Task 14 fixed. Name-based resolution
+// degrades to the same result when order *does* match field-id order, so
+// nothing is lost.
+
+/// Assign Iceberg field ids to an Arrow schema by matching field NAMES against
+/// the table schema, recursing through nested struct/list/map types.
 ///
-/// Why at schema level (not per-batch): Efficiency - avoids repeated schema modification.
-/// Why only top-level: Nested projection uses leaf column indices, not parent struct IDs.
-/// Why 1-indexed: Compatibility with iceberg-java's ParquetSchemaUtil.addFallbackIds().
-fn add_fallback_field_ids_to_arrow_schema(arrow_schema: &ArrowSchemaRef) -> Arc<ArrowSchema> {
-    debug_assert!(
-        arrow_schema
-            .fields()
-            .iter()
-            .next()
-            .is_none_or(|f| f.metadata().get(PARQUET_FIELD_ID_META_KEY).is_none()),
-        "Schema already has field IDs"
-    );
-
-    use arrow_schema::Field;
-
-    let fields_with_fallback_ids: Vec<_> = arrow_schema
+/// Read-side fallback for data files that lack embedded field ids and have no
+/// explicit `schema.name-mapping.default` table property. Name-based resolution
+/// is correct even when the file's physical column order diverges from field-id
+/// order — e.g. a schema-evolving writer that omits a column mid-schema and
+/// appends new ones. The previous position-based fallback (physical column N →
+/// field-id N+1) silently mis-bound columns in that case (observed on golden
+/// `cisco_asa`: physical `auguria_event_timestamp` at the slot of field-id 22
+/// was served as the `product_name` identity partition).
+///
+/// Columns whose names are absent from the schema are left without an id (and
+/// are filtered out during projection); columns genuinely absent from the file
+/// stay eligible for manifest back-fill (rule #1). Corresponds to Java's
+/// recursive `ApplyNameMapping` visitor, using the schema itself as the mapping.
+fn assign_field_ids_by_name(arrow_schema: &ArrowSchemaRef, iceberg_schema: &Schema) -> Arc<ArrowSchema> {
+    let fields: Vec<_> = arrow_schema
         .fields()
         .iter()
-        .enumerate()
-        .map(|(pos, field)| {
-            let mut metadata = field.metadata().clone();
-            let field_id = (pos + 1) as i32; // 1-indexed for Java compatibility
-            metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), field_id.to_string());
-
-            Field::new(field.name(), field.data_type().clone(), field.is_nullable())
-                .with_metadata(metadata)
-        })
+        .map(|field| stamp_field_ids_by_name(field, iceberg_schema.as_struct().fields()))
         .collect();
-
     Arc::new(ArrowSchema::new_with_metadata(
-        fields_with_fallback_ids,
+        fields,
         arrow_schema.metadata().clone(),
     ))
+}
+
+/// Recursively stamp an Arrow field (and its nested children) with the Iceberg
+/// field id of the same-named field in `iceberg_fields`. See
+/// [`assign_field_ids_by_name`].
+fn stamp_field_ids_by_name(
+    field: &arrow_schema::FieldRef,
+    iceberg_fields: &[NestedFieldRef],
+) -> arrow_schema::FieldRef {
+    use arrow_schema::{DataType, Field};
+
+    let matched = iceberg_fields.iter().find(|nf| nf.name == *field.name());
+
+    let mut metadata = field.metadata().clone();
+    if let Some(nf) = matched {
+        metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), nf.id.to_string());
+    }
+
+    // Recurse into nested types so leaf columns also receive ids — required
+    // because projection is leaf-field-id-based.
+    let data_type = match (field.data_type(), matched.map(|nf| nf.field_type.as_ref())) {
+        (DataType::Struct(children), Some(Type::Struct(struct_ty))) => DataType::Struct(
+            children
+                .iter()
+                .map(|c| stamp_field_ids_by_name(c, struct_ty.fields()))
+                .collect(),
+        ),
+        (DataType::List(child), Some(Type::List(list_ty))) => {
+            DataType::List(stamp_field_ids_by_name(child, std::slice::from_ref(&list_ty.element_field)))
+        }
+        (DataType::LargeList(child), Some(Type::List(list_ty))) => DataType::LargeList(
+            stamp_field_ids_by_name(child, std::slice::from_ref(&list_ty.element_field)),
+        ),
+        (DataType::Map(entries, sorted), Some(Type::Map(map_ty))) => {
+            // Map entries are a struct of {key, value}; stamp both by name.
+            let entry_fields = [map_ty.key_field.clone(), map_ty.value_field.clone()];
+            if let DataType::Struct(kv) = entries.data_type() {
+                let stamped: Vec<_> = kv
+                    .iter()
+                    .map(|c| stamp_field_ids_by_name(c, &entry_fields))
+                    .collect();
+                let entries_field = Field::new(
+                    entries.name(),
+                    DataType::Struct(stamped.into_iter().collect()),
+                    entries.is_nullable(),
+                )
+                .with_metadata(entries.metadata().clone());
+                DataType::Map(Arc::new(entries_field), *sorted)
+            } else {
+                field.data_type().clone()
+            }
+        }
+        (other, _) => other.clone(),
+    };
+
+    Arc::new(Field::new(field.name(), data_type, field.is_nullable()).with_metadata(metadata))
 }
 
 /// A visitor to collect field ids from bound predicates.
@@ -4039,6 +4132,144 @@ message schema {
             .as_primitive::<arrow_array::types::Int32Type>();
         assert_eq!(result_col1.value(0), 10);
         assert_eq!(result_col1.value(1), 20);
+    }
+
+    /// Regression for plan-46 Task 14 (golden `cisco_asa` silent partition
+    /// corruption). A field-id-less data file written by a schema-evolving
+    /// writer that (a) OMITS an identity-partition column and (b) APPENDS a
+    /// later column at the physical slot where the omitted column's field id
+    /// would fall positionally. The old position-based fallback (physical
+    /// column N → field-id N+1) bound the appended column to the partition
+    /// source field id, so the identity partition value was served the
+    /// appended column's data (on golden: `auguria_event_timestamp`
+    /// epoch-millis served as `product_name`). Name-based resolution must
+    /// instead bind the appended column to its real id and leave the omitted
+    /// identity column to be back-filled from the manifest partition tuple.
+    ///
+    /// Schema (ids): a=1 (int), ts=2 (long), product_name=3 (string, identity
+    /// partition source), evt=4 (long, appended later). Physical file columns,
+    /// in order, lack field ids and OMIT product_name: [a, ts, evt]. So the
+    /// physical slot index 2 (which positionally maps to field-id 3 =
+    /// product_name) actually holds `evt`.
+    #[tokio::test]
+    async fn test_read_parquet_without_field_ids_omitted_identity_partition_backfills_from_manifest()
+     {
+        use arrow_array::{Array, Int32Array, Int64Array};
+
+        use crate::spec::{Literal, PartitionSpecBuilder, Struct, Transform};
+
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::optional(1, "a", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(2, "ts", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(3, "product_name", Type::Primitive(PrimitiveType::String))
+                        .into(),
+                    NestedField::optional(4, "evt", Type::Primitive(PrimitiveType::Long)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let partition_spec = Arc::new(
+            PartitionSpecBuilder::new(schema.clone())
+                .with_spec_id(0)
+                .add_partition_field("product_name", "product_name", Transform::Identity)
+                .unwrap()
+                .build()
+                .unwrap(),
+        );
+        // Manifest partition tuple for this file: product_name = "widget".
+        let partition_data = Struct::from_iter(vec![Some(Literal::string("widget"))]);
+
+        // Physical file: NO field-id metadata, product_name omitted, evt
+        // appended. Column order: a, ts, evt. The distinctive evt value is what
+        // the buggy positional path would surface as product_name.
+        let arrow_schema_file = Arc::new(ArrowSchema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("ts", DataType::Int64, true),
+            Field::new("evt", DataType::Int64, true),
+        ]));
+
+        let tmp_dir = TempDir::new().unwrap();
+        let table_location = tmp_dir.path().to_str().unwrap().to_string();
+        let file_io = FileIO::from_path(&table_location).unwrap().build().unwrap();
+
+        let to_write = RecordBatch::try_new(arrow_schema_file.clone(), vec![
+            Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![100, 200])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![9_999_000_i64, 9_999_001_i64])) as ArrayRef,
+        ])
+        .unwrap();
+
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .build();
+        let file = File::create(format!("{table_location}/1.parquet")).unwrap();
+        let mut writer = ArrowWriter::try_new(file, to_write.schema(), Some(props)).unwrap();
+        writer.write(&to_write).expect("Writing batch");
+        writer.close().unwrap();
+
+        let reader = ArrowReaderBuilder::new(file_io).build();
+        let tasks = Box::pin(futures::stream::iter(
+            vec![Ok(FileScanTask {
+                file_size_in_bytes: std::fs::metadata(format!("{table_location}/1.parquet"))
+                    .unwrap()
+                    .len(),
+                start: 0,
+                length: 0,
+                record_count: None,
+                data_file_path: format!("{table_location}/1.parquet"),
+                data_file_format: DataFileFormat::Parquet,
+                schema: schema.clone(),
+                project_field_ids: vec![1, 2, 3, 4],
+                predicate: None,
+                deletes: vec![],
+                partition: Some(partition_data),
+                partition_spec: Some(partition_spec),
+                name_mapping: None,
+                case_sensitive: false,
+                data_file_content: DataContentType::Data,
+                sequence_number: 0,
+                equality_ids: None,
+            })]
+            .into_iter(),
+        )) as FileScanTaskStream;
+
+        let result = reader
+            .read(tasks)
+            .unwrap()
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        let batch = &result[0];
+        assert_eq!(batch.num_rows(), 2);
+        // Columns are in task-schema (project_field_ids) order: a, ts, product_name, evt.
+        assert_eq!(batch.num_columns(), 4);
+
+        // product_name (id 3) is absent from the file → back-filled from the
+        // manifest partition value, NOT bound to the appended evt column.
+        let product_name = batch.column(2).as_string::<i32>();
+        assert!(
+            !product_name.is_null(0),
+            "product_name must be back-filled, not NULL (the post-fix-1 failure mode)"
+        );
+        assert_eq!(product_name.value(0), "widget");
+        assert_eq!(product_name.value(1), "widget");
+
+        // evt (id 4) must carry its real values — proving the appended column
+        // was bound to id 4 by name, not consumed as product_name (id 3).
+        let evt = batch.column(3).as_primitive::<arrow_array::types::Int64Type>();
+        assert_eq!(evt.value(0), 9_999_000);
+        assert_eq!(evt.value(1), 9_999_001);
+
+        // ts (id 2) sanity check.
+        let ts = batch.column(1).as_primitive::<arrow_array::types::Int64Type>();
+        assert_eq!(ts.value(0), 100);
+        assert_eq!(ts.value(1), 200);
     }
 
     /// Test reading Parquet files without field IDs with a filter that eliminates all row groups.
