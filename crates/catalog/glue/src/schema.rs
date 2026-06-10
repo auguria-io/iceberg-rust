@@ -22,7 +22,7 @@ pub(crate) const ICEBERG_FIELD_OPTIONAL: &str = "iceberg.field.optional";
 /// Property `iceberg.field.current` for `Column`
 pub(crate) const ICEBERG_FIELD_CURRENT: &str = "iceberg.field.current";
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use aws_sdk_glue::types::Column;
 use iceberg::spec::{PrimitiveType, SchemaVisitor, TableMetadata, visit_schema};
@@ -37,6 +37,7 @@ pub(crate) struct GlueSchemaBuilder {
     schema: GlueSchema,
     is_current: bool,
     depth: usize,
+    seen_names: HashSet<String>,
 }
 
 impl GlueSchemaBuilder {
@@ -48,6 +49,7 @@ impl GlueSchemaBuilder {
             schema: Vec::new(),
             is_current: true,
             depth: 0,
+            seen_names: HashSet::new(),
         };
 
         visit_schema(current_schema, &mut builder)?;
@@ -112,6 +114,18 @@ impl SchemaVisitor for GlueSchemaBuilder {
     ) -> iceberg::Result<String> {
         if self.is_inside_struct() {
             return Ok(format!("{}:{}", field.name, &value));
+        }
+
+        // Top-level columns are deduplicated by name across schema versions,
+        // matching the Java (`IcebergToGlueConverter`) and PyIceberg
+        // (`_to_columns`) implementations. The current schema is visited
+        // first, so a name that appears in multiple schema versions keeps its
+        // current type and `iceberg.field.current=true`. Without this,
+        // every schema version re-emits the full column list and the Glue
+        // `UpdateTable` payload grows until it exceeds Glue's request size
+        // limit, permanently failing all commits on the table.
+        if !self.seen_names.insert(field.name.clone()) {
+            return Ok(value);
         }
 
         let parameters = HashMap::from([
@@ -517,6 +531,90 @@ mod tests {
         let expected = vec![
             create_column("required_field", "string", "1", false)?,
             create_column("optional_field", "int", "2", true)?,
+        ];
+
+        assert_eq!(result, expected);
+        Ok(())
+    }
+
+    /// Columns must be deduplicated by name across schema versions (matching
+    /// Java's `IcebergToGlueConverter` and PyIceberg's `_to_columns`): the
+    /// current schema's entry wins for repeated names, and historical-only
+    /// names appear once with `iceberg.field.current=false`. Without dedup,
+    /// every schema version re-emits the full column list and the Glue
+    /// `UpdateTable` payload eventually exceeds the request size limit.
+    #[test]
+    fn test_multiple_schema_versions_deduplicate_columns() -> Result<()> {
+        let v0 = r#"{
+            "type": "struct",
+            "schema-id": 0,
+            "fields": [
+                {
+                    "id": 1,
+                    "name": "kept",
+                    "required": true,
+                    "type": "int"
+                },
+                {
+                    "id": 2,
+                    "name": "dropped",
+                    "required": false,
+                    "type": "string"
+                }
+            ]
+        }"#;
+        let v1 = r#"{
+            "type": "struct",
+            "schema-id": 1,
+            "fields": [
+                {
+                    "id": 1,
+                    "name": "kept",
+                    "required": true,
+                    "type": "long"
+                },
+                {
+                    "id": 3,
+                    "name": "added",
+                    "required": false,
+                    "type": "string"
+                }
+            ]
+        }"#;
+
+        let schema_v0 = serde_json::from_str::<Schema>(v0)?;
+        let schema_v1 = serde_json::from_str::<Schema>(v1)?;
+
+        let metadata = create_metadata(schema_v0)?
+            .into_builder(None)
+            .add_current_schema(schema_v1)?
+            .build()?
+            .metadata;
+        assert_eq!(metadata.schemas_iter().count(), 2);
+
+        let result = GlueSchemaBuilder::from_iceberg(&metadata)?.build();
+
+        let historical_column = |name: &str, r#type: &str, id: &str, optional: bool| {
+            let parameters = HashMap::from([
+                (ICEBERG_FIELD_ID.to_string(), id.to_string()),
+                (ICEBERG_FIELD_OPTIONAL.to_string(), optional.to_string()),
+                (ICEBERG_FIELD_CURRENT.to_string(), "false".to_string()),
+            ]);
+            Column::builder()
+                .name(name)
+                .r#type(r#type)
+                .set_comment(None)
+                .set_parameters(Some(parameters))
+                .build()
+                .map_err(from_aws_build_error)
+        };
+
+        // Current schema first ("kept" with its CURRENT type, then "added"),
+        // then historical-only names ("dropped") — and "kept" exactly once.
+        let expected = vec![
+            create_column("kept", "bigint", "1", false)?,
+            create_column("added", "string", "3", true)?,
+            historical_column("dropped", "string", "2", true)?,
         ];
 
         assert_eq!(result, expected);
