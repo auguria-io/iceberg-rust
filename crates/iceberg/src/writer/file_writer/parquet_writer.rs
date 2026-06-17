@@ -595,8 +595,6 @@ impl FileWriter for ParquetWriter {
             Error::new(ErrorKind::Unexpected, "Failed to finish parquet writer.").with_source(err)
         })?;
 
-        let written_size = writer.bytes_written();
-
         if self.current_row_num == 0 {
             self.output_file.delete().await.map_err(|err| {
                 Error::new(
@@ -607,13 +605,44 @@ impl FileWriter for ParquetWriter {
             })?;
             Ok(vec![])
         } else {
+            // Source `file_size_in_bytes` from the actual committed object size,
+            // NOT the writer's self-reported `writer.bytes_written()`.
+            //
+            // `AsyncArrowWriter::finish()` already flushed all buffers and called
+            // `complete()` on the underlying object-store writer (see parquet
+            // 58.x async_writer: finish -> do_write -> async_writer.complete),
+            // so the object is durably present at its true final size here.
+            //
+            // `bytes_written()` is the writer's *logical* byte accounting and
+            // empirically diverges from the real object size by a few KB under
+            // concurrent writes. Iceberg-spec readers (Athena/Trino, the arrow-rs
+            // compactor) seek to `recorded_size - 8` to locate the Parquet footer,
+            // so a wrong recorded size makes a physically valid file unreadable
+            // ("Corrupt footer / Invalid Parquet file"). This mirrors the
+            // `add_files` path (`parquet_files_to_data_files`, above) which also
+            // records `input_file.metadata().await?.size`.
+            let location = self.output_file.location().to_string();
+            let written_size = self
+                .output_file
+                .to_input_file()
+                .metadata()
+                .await
+                .map_err(|err| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        "Failed to read committed parquet object size after close.",
+                    )
+                    .with_source(err)
+                })?
+                .size as usize;
+
             let parquet_metadata = Arc::new(metadata);
 
             Ok(vec![Self::parquet_to_data_file_builder(
                 self.schema,
                 parquet_metadata,
                 written_size,
-                self.output_file.location().to_string(),
+                location,
                 self.nan_value_count_visitor.nan_value_counts,
             )?])
         }
@@ -1004,6 +1033,201 @@ mod tests {
         // check the written file
         let expect_batch = concat_batches(&schema, vec![&to_write, &to_write_null]).unwrap();
         check_parquet_data_file(&file_io, &data_file, &expect_batch).await;
+
+        Ok(())
+    }
+
+    /// Regression test for the `file_size_in_bytes` mismatch (paddingtonstation
+    /// plan-46 doc-37): `ParquetWriter::close()` must record the *actual*
+    /// committed object size, not the writer's self-reported `bytes_written()`.
+    /// A wrong recorded size makes Iceberg-spec readers seek to the wrong footer
+    /// offset and report "Corrupt footer" on a physically valid file.
+    ///
+    /// The production divergence is a concurrency/async-flush effect that a
+    /// single-threaded unit test cannot force deterministically; this test locks
+    /// the *invariant* — recorded size == the object size measured independently
+    /// from the store — so any revert to `bytes_written()` that ever diverges is
+    /// caught. Uses a small row-group count to force multiple flush cycles.
+    #[tokio::test]
+    async fn test_parquet_writer_records_actual_object_size() -> Result<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let file_io = FileIOBuilder::new_fs_io().build().unwrap();
+        let location_gen = DefaultLocationGenerator::with_data_location(
+            temp_dir.path().to_str().unwrap().to_string(),
+        );
+        let file_name_gen =
+            DefaultFileNameGenerator::new("test".to_string(), None, DataFileFormat::Parquet);
+
+        let schema = {
+            let fields =
+                vec![
+                    Field::new("col", DataType::Int64, true).with_metadata(HashMap::from([(
+                        PARQUET_FIELD_ID_META_KEY.to_string(),
+                        "0".to_string(),
+                    )])),
+                ];
+            Arc::new(arrow_schema::Schema::new(fields))
+        };
+        let col = Arc::new(Int64Array::from_iter_values(0..4096)) as ArrayRef;
+        let to_write = RecordBatch::try_new(schema.clone(), vec![col]).unwrap();
+
+        let output_file = file_io.new_output(
+            location_gen.generate_location(None, &file_name_gen.generate_file_name()),
+        )?;
+
+        let mut pw = ParquetWriterBuilder::new(
+            WriterProperties::builder()
+                // small row groups => multiple `do_write` flush cycles before close
+                .set_max_row_group_row_count(Some(256))
+                .build(),
+            Arc::new(to_write.schema().as_ref().try_into().unwrap()),
+        )
+        .build(output_file)
+        .await?;
+        pw.write(&to_write).await?;
+        let res = pw.close().await?;
+        assert_eq!(res.len(), 1);
+        let data_file = res
+            .into_iter()
+            .next()
+            .unwrap()
+            .content(DataContentType::Data)
+            .partition(Struct::empty())
+            .partition_spec_id(0)
+            .build()
+            .unwrap();
+
+        // Independently stat the committed object and assert the recorded size
+        // matches it exactly.
+        let actual_size = file_io
+            .new_input(data_file.file_path())?
+            .metadata()
+            .await?
+            .size;
+        assert_eq!(
+            data_file.file_size_in_bytes(),
+            actual_size,
+            "recorded file_size_in_bytes ({}) must equal the actual object size ({})",
+            data_file.file_size_in_bytes(),
+            actual_size,
+        );
+
+        Ok(())
+    }
+
+    /// Demonstrates *why* the recorded size must be the real object size:
+    /// the consequence of the old `bytes_written()` logic when it diverged.
+    ///
+    /// Iceberg readers seek to `recorded_size - 8` to read `[footer_len][PAR1]`,
+    /// so a wrong `file_size_in_bytes` makes a *physically valid* Parquet file
+    /// unreadable ("Corrupt footer"). This test writes one valid file, then
+    /// drives the iceberg reader (`ArrowFileReader::get_metadata`, which uses
+    /// `FileMetadata.size`) three ways:
+    ///   - recorded < actual  (the griff/cato symptom, gap 1327) -> ERROR
+    ///   - recorded > actual  (the other prod direction)         -> ERROR
+    ///   - recorded == actual (what the patch records)           -> OK
+    /// The OK case fails if the writer ever regresses to a size that doesn't
+    /// match the object; the ERROR cases prove the gap is not benign.
+    #[tokio::test]
+    async fn test_wrong_file_size_in_bytes_breaks_reader() -> Result<()> {
+        use parquet::arrow::async_reader::AsyncFileReader;
+
+        use crate::arrow::ArrowFileReader;
+        use crate::io::FileMetadata;
+
+        let temp_dir = TempDir::new().unwrap();
+        let file_io = FileIOBuilder::new_fs_io().build().unwrap();
+        let location_gen = DefaultLocationGenerator::with_data_location(
+            temp_dir.path().to_str().unwrap().to_string(),
+        );
+        let file_name_gen =
+            DefaultFileNameGenerator::new("test".to_string(), None, DataFileFormat::Parquet);
+
+        let schema = {
+            let fields =
+                vec![
+                    Field::new("col", DataType::Int64, true).with_metadata(HashMap::from([(
+                        PARQUET_FIELD_ID_META_KEY.to_string(),
+                        "0".to_string(),
+                    )])),
+                ];
+            Arc::new(arrow_schema::Schema::new(fields))
+        };
+        let col = Arc::new(Int64Array::from_iter_values(0..8192)) as ArrayRef;
+        let to_write = RecordBatch::try_new(schema.clone(), vec![col]).unwrap();
+
+        let output_file = file_io.new_output(
+            location_gen.generate_location(None, &file_name_gen.generate_file_name()),
+        )?;
+        let mut pw = ParquetWriterBuilder::new(
+            WriterProperties::builder()
+                .set_max_row_group_row_count(Some(256))
+                .build(),
+            Arc::new(to_write.schema().as_ref().try_into().unwrap()),
+        )
+        .build(output_file)
+        .await?;
+        pw.write(&to_write).await?;
+        let res = pw.close().await?;
+        let data_file = res
+            .into_iter()
+            .next()
+            .unwrap()
+            .content(DataContentType::Data)
+            .partition(Struct::empty())
+            .partition_spec_id(0)
+            .build()
+            .unwrap();
+
+        let actual_size = file_io
+            .new_input(data_file.file_path())?
+            .metadata()
+            .await?
+            .size;
+        // Sanity: the patched writer recorded the real object size.
+        assert_eq!(data_file.file_size_in_bytes(), actual_size);
+
+        let path = data_file.file_path().to_string();
+        let read_with_size = |size: u64| {
+            let file_io = file_io.clone();
+            let path = path.clone();
+            async move {
+                let reader = file_io.new_input(&path)?.reader().await?;
+                let mut arrow_reader = ArrowFileReader::new(
+                    FileMetadata {
+                        size,
+                        last_modified_ms: None,
+                        is_dir: false,
+                    },
+                    reader,
+                );
+                arrow_reader
+                    .get_metadata(None)
+                    .await
+                    .map(|m| m.file_metadata().num_rows())
+                    .map_err(|err| {
+                        Error::new(ErrorKind::DataInvalid, "failed to read parquet metadata")
+                            .with_source(err)
+                    })
+            }
+        };
+
+        // recorded < actual: reader seeks short, lands mid-file -> corrupt footer.
+        assert!(
+            read_with_size(actual_size - 1327).await.is_err(),
+            "a valid file with recorded size < actual must fail to read (corrupt footer)"
+        );
+        // recorded > actual: reader seeks past EOF -> read-beyond-end error.
+        assert!(
+            read_with_size(actual_size + 2048).await.is_err(),
+            "a valid file with recorded size > actual must fail to read (seek past EOF)"
+        );
+        // recorded == actual (what the patch records): reads cleanly.
+        assert_eq!(
+            read_with_size(actual_size).await?,
+            8192,
+            "the correct recorded size must read the file back successfully"
+        );
 
         Ok(())
     }
