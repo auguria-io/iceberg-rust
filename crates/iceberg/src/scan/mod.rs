@@ -56,6 +56,8 @@ pub struct TableScanBuilder<'a> {
     from_snapshot_id: Option<i64>,
     /// Inclusive. Used for incremental scan.
     to_snapshot_id: Option<i64>,
+    /// Exclusive sequence-number lower bound for snapshot scans.
+    min_sequence_number: Option<i64>,
     batch_size: Option<usize>,
     case_sensitive: bool,
     filter: Option<Predicate>,
@@ -76,6 +78,7 @@ impl<'a> TableScanBuilder<'a> {
             snapshot_id: None,
             from_snapshot_id: None,
             to_snapshot_id: None,
+            min_sequence_number: None,
             batch_size: None,
             case_sensitive: true,
             filter: None,
@@ -146,6 +149,14 @@ impl<'a> TableScanBuilder<'a> {
     /// Set the ending snapshot id (inclusive) for incremental scan.
     pub fn to_snapshot_id(mut self, to_snapshot_id: i64) -> Self {
         self.to_snapshot_id = Some(to_snapshot_id);
+        self
+    }
+
+    /// Set an exclusive lower bound for planned manifest entries by Iceberg
+    /// sequence number. Manifest files whose max sequence number is less than
+    /// or equal to this value are pruned before being opened.
+    pub fn min_sequence_number(mut self, min_sequence_number: i64) -> Self {
+        self.min_sequence_number = Some(min_sequence_number);
         self
     }
 
@@ -326,6 +337,7 @@ impl<'a> TableScanBuilder<'a> {
             field_ids: Arc::new(field_ids),
             from_snapshot_id: self.from_snapshot_id,
             to_snapshot_id: self.to_snapshot_id,
+            min_sequence_number: self.min_sequence_number,
             partition_filter_cache: Arc::new(PartitionFilterCache::new()),
             manifest_evaluator_cache: Arc::new(ManifestEvaluatorCache::new()),
             expression_evaluator_cache: Arc::new(ExpressionEvaluatorCache::new()),
@@ -1332,6 +1344,47 @@ pub mod tests {
             tasks[1].data_file_path,
             format!("{}/3.parquet", &fixture.table_location)
         );
+    }
+
+    #[tokio::test]
+    async fn test_plan_files_prunes_by_min_sequence_number() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_files().await;
+
+        let post_watermark_tasks: Vec<_> = fixture
+            .table
+            .scan()
+            .min_sequence_number(0)
+            .build()
+            .unwrap()
+            .plan_files()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        assert_eq!(post_watermark_tasks.len(), 1);
+        assert_eq!(
+            post_watermark_tasks[0].data_file_path,
+            format!("{}/1.parquet", &fixture.table_location)
+        );
+        assert_eq!(post_watermark_tasks[0].sequence_number, 1);
+
+        let no_post_watermark_tasks: Vec<_> = fixture
+            .table
+            .scan()
+            .min_sequence_number(1)
+            .build()
+            .unwrap()
+            .plan_files()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        assert!(no_post_watermark_tasks.is_empty());
     }
 
     #[tokio::test]

@@ -203,6 +203,7 @@ pub(crate) struct PlanContext {
     // If `to_snapshot_id` is set, it means incremental scan. `from_snapshot_id` can be `None`.
     pub from_snapshot_id: Option<i64>,
     pub to_snapshot_id: Option<i64>,
+    pub min_sequence_number: Option<i64>,
 }
 
 impl PlanContext {
@@ -295,6 +296,24 @@ impl PlanContext {
                 manifest_list.entries().to_vec()
             }
         };
+
+        if let Some(min_sequence_number) = self.min_sequence_number {
+            manifest_files
+                .retain(|manifest_file| manifest_file.sequence_number > min_sequence_number);
+            filter_fn = Some(match filter_fn {
+                Some(existing_filter_fn) => Arc::new(move |entry: &ManifestEntryRef| {
+                    existing_filter_fn(entry)
+                        && entry
+                            .sequence_number()
+                            .is_some_and(|sequence_number| sequence_number > min_sequence_number)
+                }),
+                None => Arc::new(move |entry: &ManifestEntryRef| {
+                    entry
+                        .sequence_number()
+                        .is_some_and(|sequence_number| sequence_number > min_sequence_number)
+                }),
+            });
+        }
 
         // Sort manifest files to process delete manifests first.
         // This avoids a deadlock where the producer blocks on sending data manifest entries
