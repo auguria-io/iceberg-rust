@@ -47,7 +47,15 @@ mod catalog;
 mod error;
 mod schema;
 mod utils;
+// Re-exported so callers can name the types appearing in the public signatures
+// below at a guaranteed-matching SDK version. Deliberately narrow: re-exporting
+// the whole SDK crate would pull all of it into this crate's semver surface.
+// Callers that go on to *call* Glue still need their own `aws-sdk-glue`
+// dependency for `Client`; these are the only SDK types this crate's API names.
+pub use aws_sdk_glue::types::{StorageDescriptor, TableInput};
 pub use catalog::*;
+pub use schema::storage_descriptor_for_table;
 pub use utils::{
     AWS_ACCESS_KEY_ID, AWS_PROFILE_NAME, AWS_REGION_NAME, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN,
+    convert_to_glue_table,
 };

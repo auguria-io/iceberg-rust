@@ -24,13 +24,37 @@ pub(crate) const ICEBERG_FIELD_CURRENT: &str = "iceberg.field.current";
 
 use std::collections::{HashMap, HashSet};
 
-use aws_sdk_glue::types::Column;
-use iceberg::spec::{PrimitiveType, SchemaVisitor, TableMetadata, visit_schema};
+use aws_sdk_glue::types::{Column, StorageDescriptor};
 use iceberg::Result;
+use iceberg::spec::{PrimitiveType, Schema, SchemaVisitor, TableMetadata, visit_schema};
 
 use crate::error::from_aws_build_error;
 
 type GlueSchema = Vec<Column>;
+
+/// Builds the Glue `StorageDescriptor` for an Iceberg table.
+///
+/// This is the same function `GlueCatalog` uses on its own write path, so a
+/// descriptor built here is byte-for-byte what the catalog would write for the
+/// same metadata — including on the next commit, which rebuilds the descriptor
+/// from scratch rather than patching it.
+///
+/// Only `columns` and `location` are set, because those are the only fields
+/// that survive a catalog commit; anything else would be silently dropped the
+/// first time the table is updated. `location` is the table root
+/// (`metadata.location()`), **not** the metadata file path — conflating the two
+/// yields a wrong envelope.
+///
+/// Prefer [`crate::convert_to_glue_table`] when creating a Glue table: it
+/// derives the descriptor and the metadata-pointer parameters from the same
+/// arguments, so the two cannot disagree. Reach for this lower-level function
+/// only when you need the descriptor alone.
+pub fn storage_descriptor_for_table(metadata: &TableMetadata) -> Result<StorageDescriptor> {
+    Ok(StorageDescriptor::builder()
+        .set_columns(Some(GlueSchemaBuilder::from_iceberg(metadata)?.build()))
+        .location(metadata.location().to_string())
+        .build())
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct GlueSchemaBuilder {
@@ -41,18 +65,21 @@ pub(crate) struct GlueSchemaBuilder {
 }
 
 impl GlueSchemaBuilder {
-    /// Creates a new `GlueSchemaBuilder` from iceberg `Schema`
-    pub fn from_iceberg(metadata: &TableMetadata) -> Result<GlueSchemaBuilder> {
-        let current_schema = metadata.current_schema();
-
+    fn from_schema(schema: &Schema) -> Result<Self> {
         let mut builder = Self {
-            schema: Vec::new(),
             is_current: true,
-            depth: 0,
-            seen_names: HashSet::new(),
+            ..Default::default()
         };
 
-        visit_schema(current_schema, &mut builder)?;
+        visit_schema(schema, &mut builder)?;
+
+        Ok(builder)
+    }
+
+    /// Creates a new `GlueSchemaBuilder` from Iceberg table metadata.
+    pub fn from_iceberg(metadata: &TableMetadata) -> Result<GlueSchemaBuilder> {
+        let current_schema = metadata.current_schema();
+        let mut builder = Self::from_schema(current_schema)?;
 
         builder.is_current = false;
 
@@ -181,9 +208,7 @@ impl SchemaVisitor for GlueSchemaBuilder {
             // implicitly UTC, so tz-aware Iceberg timestamps map onto
             // them without semantic loss. Athena reads both as UTC.
             PrimitiveType::Timestamp | PrimitiveType::Timestamptz => "timestamp".to_string(),
-            PrimitiveType::TimestampNs | PrimitiveType::TimestamptzNs => {
-                "timestamp_ns".to_string()
-            }
+            PrimitiveType::TimestampNs | PrimitiveType::TimestamptzNs => "timestamp_ns".to_string(),
             PrimitiveType::Time | PrimitiveType::String | PrimitiveType::Uuid => {
                 "string".to_string()
             }
@@ -200,7 +225,7 @@ impl SchemaVisitor for GlueSchemaBuilder {
 #[cfg(test)]
 mod tests {
     use iceberg::TableCreation;
-    use iceberg::spec::{Schema, TableMetadataBuilder};
+    use iceberg::spec::{NestedField, Schema, TableMetadataBuilder};
 
     use super::*;
 
@@ -215,6 +240,14 @@ mod tests {
             .metadata;
 
         Ok(metadata)
+    }
+
+    /// Columns a single-schema table yields — the fresh-table case, where the
+    /// current schema is the whole schema history.
+    fn current_columns(schema: Schema) -> Result<Vec<Column>> {
+        Ok(storage_descriptor_for_table(&create_metadata(schema)?)?
+            .columns()
+            .to_vec())
     }
 
     fn create_column(
@@ -236,6 +269,157 @@ mod tests {
             .set_parameters(Some(parameters))
             .build()
             .map_err(from_aws_build_error)
+    }
+
+    /// Every Iceberg primitive maps onto its Glue type string. The collapsing
+    /// cases are the ones worth pinning: both tz-aware timestamps join their
+    /// naive counterparts, and `time`/`uuid` degrade to `string`.
+    #[test]
+    fn test_primitive_type_mapping() -> Result<()> {
+        let cases = [
+            (PrimitiveType::Boolean, "boolean"),
+            (PrimitiveType::Int, "int"),
+            (PrimitiveType::Long, "bigint"),
+            (PrimitiveType::Float, "float"),
+            (PrimitiveType::Double, "double"),
+            (
+                PrimitiveType::Decimal {
+                    precision: 12,
+                    scale: 3,
+                },
+                "decimal(12,3)",
+            ),
+            (PrimitiveType::Date, "date"),
+            (PrimitiveType::Time, "string"),
+            (PrimitiveType::Timestamp, "timestamp"),
+            (PrimitiveType::Timestamptz, "timestamp"),
+            (PrimitiveType::TimestampNs, "timestamp_ns"),
+            (PrimitiveType::TimestamptzNs, "timestamp_ns"),
+            (PrimitiveType::String, "string"),
+            (PrimitiveType::Uuid, "string"),
+            (PrimitiveType::Fixed(8), "binary"),
+            (PrimitiveType::Binary, "binary"),
+        ];
+
+        for (primitive, expected_type) in cases {
+            // Declared id 42, expected id 1: table *creation* reassigns field
+            // ids from FIRST_FIELD_ID (and rewrites the declared schema id),
+            // so the declared value cannot survive. Only creation does this —
+            // `register_table` and `update_table` pass through whatever ids
+            // the existing metadata carries.
+            let schema = Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(42, "c", primitive.into()).into(),
+                ])
+                .build()?;
+
+            assert_eq!(current_columns(schema)?, [create_column(
+                "c",
+                expected_type,
+                "1",
+                false
+            )?]);
+        }
+
+        Ok(())
+    }
+
+    /// A field's doc becomes the Glue column comment; an undocumented field
+    /// carries none.
+    #[test]
+    fn test_field_doc_becomes_column_comment() -> Result<()> {
+        let schema = Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                NestedField::optional(1, "documented", PrimitiveType::String.into())
+                    .with_doc("what it holds")
+                    .into(),
+                NestedField::required(2, "undocumented", PrimitiveType::Long.into()).into(),
+            ])
+            .build()?;
+
+        let columns = current_columns(schema)?;
+
+        assert_eq!(columns[0].comment(), Some("what it holds"));
+        assert_eq!(columns[1..], [create_column(
+            "undocumented",
+            "bigint",
+            "2",
+            false
+        )?]);
+
+        Ok(())
+    }
+
+    /// The contract downstream tooling relies on: what `GlueCatalog` writes
+    /// into a table's `StorageDescriptor` is *exactly* what the public builder
+    /// returns — whole descriptor, historical columns included. The two share
+    /// one implementation, so this guards against a divergent descriptor being
+    /// reintroduced on the catalog path.
+    #[test]
+    fn test_catalog_writes_exactly_the_public_descriptor() -> Result<()> {
+        let historical = Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                NestedField::optional(9, "historical_only", PrimitiveType::String.into()).into(),
+            ])
+            .build()?;
+        let current = Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                NestedField::required(1, "id", PrimitiveType::Long.into()).into(),
+                NestedField::optional(2, "label", PrimitiveType::String.into()).into(),
+            ])
+            .build()?;
+
+        let metadata = create_metadata(historical)?
+            .into_builder(None)
+            .add_current_schema(current)?
+            .build()?
+            .metadata;
+        let table = crate::utils::convert_to_glue_table(
+            "table",
+            "metadata".to_string(),
+            &metadata,
+            &HashMap::new(),
+            None,
+        )?;
+        let written = table
+            .storage_descriptor()
+            .expect("glue table must carry a storage descriptor");
+
+        // Wiring: the catalog descriptor IS the public one. Tautological while
+        // the two share an implementation — it fires only if a divergent build
+        // is reintroduced on the catalog path.
+        assert_eq!(*written, storage_descriptor_for_table(&metadata)?);
+
+        // Content, asserted independently of that shared implementation:
+        // current schema first, historical-only column retained and flagged
+        // non-current. A wrong three-column descriptor fails here.
+        let observed: Vec<_> = written
+            .columns()
+            .iter()
+            .map(|c| {
+                (
+                    c.name(),
+                    c.r#type().expect("column has a type"),
+                    c.parameters()
+                        .and_then(|p| p.get(ICEBERG_FIELD_CURRENT))
+                        .map(String::as_str)
+                        .expect("column carries iceberg.field.current"),
+                )
+            })
+            .collect();
+
+        assert_eq!(observed, vec![
+            ("id", "bigint", "true"),
+            ("label", "string", "true"),
+            ("historical_only", "string", "false"),
+        ]);
+        assert_eq!(written.location(), Some("my_location"));
+
+        Ok(())
     }
 
     #[test]

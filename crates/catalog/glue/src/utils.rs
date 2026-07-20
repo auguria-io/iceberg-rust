@@ -19,12 +19,12 @@ use std::collections::HashMap;
 
 use aws_config::{BehaviorVersion, Region, SdkConfig};
 use aws_sdk_glue::config::Credentials;
-use aws_sdk_glue::types::{Database, DatabaseInput, StorageDescriptor, TableInput};
+use aws_sdk_glue::types::{Database, DatabaseInput, TableInput};
 use iceberg::spec::TableMetadata;
 use iceberg::{Error, ErrorKind, Namespace, NamespaceIdent, Result};
 
 use crate::error::from_aws_build_error;
-use crate::schema::GlueSchemaBuilder;
+use crate::schema::storage_descriptor_for_table;
 
 /// Property aws profile name
 pub const AWS_PROFILE_NAME: &str = "profile_name";
@@ -139,19 +139,21 @@ pub(crate) fn convert_to_namespace(database: &Database) -> Namespace {
 /// This function facilitates the integration of Iceberg tables with AWS Glue
 /// by converting Iceberg table metadata into a Glue-compatible `TableInput`
 /// structure.
-pub(crate) fn convert_to_glue_table(
+///
+/// This is the whole Glue-side envelope: storage descriptor, the
+/// `table_type=ICEBERG` / `metadata_location` parameters, and
+/// `EXTERNAL_TABLE`. Tools creating a Glue table outside this catalog should
+/// call this rather than assembling the pieces, so that the descriptor and the
+/// metadata pointer cannot disagree — they are derived from the same arguments
+/// in one call.
+pub fn convert_to_glue_table(
     table_name: impl Into<String>,
     metadata_location: String,
     metadata: &TableMetadata,
     properties: &HashMap<String, String>,
     prev_metadata_location: Option<String>,
 ) -> Result<TableInput> {
-    let glue_schema = GlueSchemaBuilder::from_iceberg(metadata)?.build();
-
-    let storage_descriptor = StorageDescriptor::builder()
-        .set_columns(Some(glue_schema))
-        .location(metadata.location().to_string())
-        .build();
+    let storage_descriptor = storage_descriptor_for_table(metadata)?;
 
     let mut parameters = HashMap::from([
         (TABLE_TYPE.to_string(), ICEBERG.to_string()),
@@ -260,7 +262,7 @@ macro_rules! with_catalog_id {
 #[cfg(test)]
 mod tests {
     use aws_sdk_glue::config::ProvideCredentials;
-    use aws_sdk_glue::types::Column;
+    use aws_sdk_glue::types::{Column, StorageDescriptor};
     use iceberg::spec::{NestedField, PrimitiveType, Schema, TableMetadataBuilder, Type};
     use iceberg::{MetadataLocation, Namespace, Result, TableCreation};
 
