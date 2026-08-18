@@ -27,6 +27,8 @@ impl Transaction {
     ///
     /// This opt-in path never refreshes, rebases, backs off, or retries. The
     /// transaction must have been constructed from [`ExactTableBase::table`].
+    /// A caller that cancels this future after polling must classify the result
+    /// as ambiguous and must not retry the catalog mutation.
     pub async fn commit_exact_base(
         self,
         catalog: &dyn Catalog,
@@ -165,21 +167,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mismatched_transaction_is_rejected_before_catalog_calls() {
+    async fn every_mismatched_base_field_is_rejected_before_catalog_calls() {
         let table = setup_test_table("9");
-        let different_table = table
+        let different_location = table
             .clone()
             .with_metadata_location("s3://bucket/test/location/metadata/v2.json".to_string());
-        let tx = transaction_with_update(&different_table);
-        let mut catalog = exact_mock();
-        catalog.expect_update_table_exact().times(0);
+        let different_identifier = Table::builder()
+            .file_io(table.file_io().clone())
+            .metadata(table.metadata().clone())
+            .metadata_location(table.metadata_location().unwrap())
+            .identifier(crate::TableIdent::from_strs(["other", "table"]).unwrap())
+            .build()
+            .unwrap();
+        let different_metadata = Table::builder()
+            .file_io(table.file_io().clone())
+            .metadata(make_v2_table().metadata().clone())
+            .metadata_location(table.metadata_location().unwrap())
+            .identifier(table.identifier().clone())
+            .build()
+            .unwrap();
 
-        let error = tx
-            .commit_exact_base(&catalog, exact_base(&table))
-            .await
-            .unwrap_err();
+        for mismatched in [different_location, different_identifier, different_metadata] {
+            let mut catalog = exact_mock();
+            catalog.expect_update_table_exact().times(0);
 
-        assert!(matches!(error, ExactCommitError::BeforeCas { .. }));
+            let error = transaction_with_update(&mismatched)
+                .commit_exact_base(&catalog, exact_base(&table))
+                .await
+                .unwrap_err();
+
+            assert!(matches!(error, ExactCommitError::BeforeCas { .. }));
+        }
     }
 
     #[tokio::test]

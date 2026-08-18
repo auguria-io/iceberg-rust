@@ -331,11 +331,14 @@ mod tests {
         let mut server = Server::new_async().await;
         let temp_dir = TempDir::new().unwrap();
         let (catalog, _, base) = exact_fixture(&mut server, &temp_dir).await;
+        let base_location = base.table().metadata_location().unwrap().to_string();
         let update = server
             .mock("POST", "/")
             .match_header("x-amz-target", "AWSGlue.UpdateTable")
             .match_body(Matcher::Regex(r#"\"VersionId\":\"17\""#.to_string()))
-            .match_body(Matcher::Regex("previous_metadata_location".to_string()))
+            .match_body(Matcher::Regex(format!(
+                r#"\"previous_metadata_location\":\"{base_location}\""#
+            )))
             .with_status(200)
             .with_header("content-type", "application/x-amz-json-1.1")
             .with_body("{}")
@@ -399,8 +402,70 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(error, ExactCommitError::Ambiguous { .. }));
+        let ExactCommitError::Ambiguous {
+            staged_metadata_location,
+            ..
+        } = error
+        else {
+            panic!("transient response must be ambiguous");
+        };
+        assert!(
+            catalog
+                .file_io()
+                .new_input(staged_metadata_location)
+                .unwrap()
+                .exists()
+                .await
+                .unwrap(),
+            "ambiguous staged metadata must be preserved"
+        );
         update.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn explicit_rejection_is_known_no_mutation() {
+        let mut server = Server::new_async().await;
+        let temp_dir = TempDir::new().unwrap();
+        let (catalog, _, base) = exact_fixture(&mut server, &temp_dir).await;
+        let update = server
+            .mock("POST", "/")
+            .match_header("x-amz-target", "AWSGlue.UpdateTable")
+            .with_status(400)
+            .with_header("content-type", "application/x-amz-json-1.1")
+            .with_body(
+                json!({
+                    "__type": "InvalidInputException",
+                    "Message": "request rejected"
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let error = exact_transaction(&base)
+            .commit_exact_base(&catalog, base)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ExactCommitError::RejectedNoMutation { .. }));
+        update.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn receipt_is_bound_to_one_catalog_instance() {
+        let mut server = Server::new_async().await;
+        let temp_dir = TempDir::new().unwrap();
+        let (catalog, _, base) = exact_fixture(&mut server, &temp_dir).await;
+        let (other_catalog, _, _) = test_catalog(&server, &temp_dir).await;
+
+        let error = exact_transaction(&base)
+            .commit_exact_base(&other_catalog, base)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ExactCommitError::BeforeCas { .. }));
+        drop(catalog);
     }
 
     #[tokio::test]
