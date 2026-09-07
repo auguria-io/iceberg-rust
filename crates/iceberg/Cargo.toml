@@ -96,6 +96,7 @@ zstd = { workspace = true }
 hashbrown = "0.17.0"
 
 [dev-dependencies]
+allocation-counter = "0.8"
 expect-test = { workspace = true }
 iceberg_test_utils = { path = "../test_utils", features = ["tests"] }
 mockall = { workspace = true }
