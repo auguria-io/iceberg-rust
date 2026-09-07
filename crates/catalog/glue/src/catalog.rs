@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::sync::Arc;
 
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -29,8 +30,8 @@ use iceberg::io::{
 use iceberg::spec::{TableMetadata, TableMetadataBuilder};
 use iceberg::table::Table;
 use iceberg::{
-    Catalog, CatalogBuilder, Error, ErrorKind, MetadataLocation, Namespace, NamespaceIdent, Result,
-    TableCommit, TableCreation, TableIdent,
+    Catalog, CatalogBuilder, Error, ErrorKind, ExactCommitResult, ExactTableBase, MetadataLocation,
+    Namespace, NamespaceIdent, Result, TableCommit, TableCreation, TableIdent,
 };
 
 use crate::error::{from_aws_build_error, from_aws_sdk_error};
@@ -41,6 +42,8 @@ use crate::utils::{
 use crate::{
     AWS_ACCESS_KEY_ID, AWS_REGION_NAME, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, with_catalog_id,
 };
+
+mod exact;
 
 /// Glue catalog URI
 pub const GLUE_CATALOG_PROP_URI: &str = "uri";
@@ -136,6 +139,8 @@ pub struct GlueCatalog {
     config: GlueCatalogConfig,
     client: GlueClient,
     file_io: FileIO,
+    /// Per-instance identity used to bind exact-base receipts to this catalog.
+    exact_identity: Arc<()>,
 }
 
 impl Debug for GlueCatalog {
@@ -190,6 +195,7 @@ impl GlueCatalog {
             config,
             client: GlueClient(client),
             file_io,
+            exact_identity: Arc::new(()),
         })
     }
     /// Get the catalogs `FileIO`
@@ -839,5 +845,20 @@ impl Catalog for GlueCatalog {
         })?;
 
         Ok(staged_table)
+    }
+
+    async fn load_table_exact(
+        &self,
+        table_ident: &TableIdent,
+    ) -> ExactCommitResult<ExactTableBase> {
+        self.load_table_exact_impl(table_ident).await
+    }
+
+    async fn update_table_exact(
+        &self,
+        base: ExactTableBase,
+        commit: TableCommit,
+    ) -> ExactCommitResult<Table> {
+        self.update_table_exact_impl(base, commit).await
     }
 }

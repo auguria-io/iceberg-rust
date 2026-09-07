@@ -51,6 +51,7 @@
 /// The `ApplyTransactionAction` trait provides an `apply` method
 /// that allows users to apply a transaction action to a `Transaction`.
 mod action;
+mod exact;
 
 pub use action::*;
 mod append;
@@ -269,20 +270,7 @@ impl Transaction {
             self.table = refreshed.clone();
         }
 
-        let mut current_table = self.table.clone();
-        let mut existing_updates: Vec<TableUpdate> = vec![];
-        let mut existing_requirements: Vec<TableRequirement> = vec![];
-
-        for action in &self.actions {
-            let action_commit = Arc::clone(action).commit(&current_table).await?;
-            // apply action commit to current_table
-            current_table = Self::apply(
-                current_table,
-                action_commit,
-                &mut existing_updates,
-                &mut existing_requirements,
-            )?;
-        }
+        let (existing_updates, existing_requirements) = self.apply_actions().await?;
 
         let table_commit = TableCommit::builder()
             .ident(self.table.identifier().to_owned())
@@ -291,6 +279,24 @@ impl Transaction {
             .build();
 
         catalog.update_table(table_commit).await
+    }
+
+    async fn apply_actions(&self) -> Result<(Vec<TableUpdate>, Vec<TableRequirement>)> {
+        let mut current_table = self.table.clone();
+        let mut updates = Vec::new();
+        let mut requirements = Vec::new();
+
+        for action in &self.actions {
+            let action_commit = Arc::clone(action).commit(&current_table).await?;
+            current_table = Self::apply(
+                current_table,
+                action_commit,
+                &mut updates,
+                &mut requirements,
+            )?;
+        }
+
+        Ok((updates, requirements))
     }
 }
 
