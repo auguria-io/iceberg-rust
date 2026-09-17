@@ -247,12 +247,23 @@ mod tests {
         server: &Server,
         temp_dir: &TempDir,
     ) -> (GlueCatalog, TableIdent, String) {
+        test_catalog_with_request_policy(server, temp_dir, None).await
+    }
+
+    async fn test_catalog_with_request_policy(
+        server: &Server,
+        temp_dir: &TempDir,
+        single_attempt: Option<&str>,
+    ) -> (GlueCatalog, TableIdent, String) {
         let warehouse = temp_dir.path().to_string_lossy().into_owned();
-        let props = HashMap::from([
+        let mut props = HashMap::from([
             (AWS_ACCESS_KEY_ID.to_string(), "access-key".to_string()),
             (AWS_SECRET_ACCESS_KEY.to_string(), "secret-key".to_string()),
             (AWS_REGION_NAME.to_string(), "us-east-1".to_string()),
         ]);
+        if let Some(value) = single_attempt {
+            props.insert("single-attempt-requests".to_string(), value.to_string());
+        }
         let catalog = GlueCatalog::new(GlueCatalogConfig {
             name: Some("exact-test".to_string()),
             uri: Some(server.url()),
@@ -290,6 +301,149 @@ mod tests {
             .unwrap();
 
         (catalog, table_ident, metadata_location)
+    }
+
+    #[tokio::test]
+    async fn single_attempt_catalog_does_not_retry_delete_after_ambiguous_response() {
+        let mut server = Server::new_async().await;
+        let temp_dir = TempDir::new().unwrap();
+        let (catalog, ident, _) =
+            test_catalog_with_request_policy(&server, &temp_dir, Some("true")).await;
+        let request = server
+            .mock("POST", "/")
+            .match_header("x-amz-target", "AWSGlue.DeleteTable")
+            .with_status(500)
+            .with_header("content-type", "application/x-amz-json-1.1")
+            .with_body(r#"{"__type":"InternalServiceException","Message":"unknown outcome"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        assert!(catalog.drop_table(&ident).await.is_err());
+        request.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn single_attempt_catalog_covers_create_register_and_ordinary_update() {
+        let mut server = Server::new_async().await;
+        let temp_dir = TempDir::new().unwrap();
+        let (catalog, ident, metadata_location) =
+            test_catalog_with_request_policy(&server, &temp_dir, Some("true")).await;
+        let get = mock_get_table(&mut server, &ident, metadata_location.clone(), Some("1")).await;
+        let table = catalog.load_table(&ident).await.unwrap();
+        get.assert_async().await;
+        get.remove_async().await;
+
+        let create = server
+            .mock("POST", "/")
+            .match_header("x-amz-target", "AWSGlue.CreateTable")
+            .with_status(500)
+            .with_header("content-type", "application/x-amz-json-1.1")
+            .with_body(r#"{"__type":"InternalServiceException","Message":"unknown outcome"}"#)
+            .expect(2)
+            .create_async()
+            .await;
+        assert!(
+            catalog
+                .create_table(
+                    ident.namespace(),
+                    TableCreation::builder()
+                        .name("new_table".into())
+                        .location(format!("{}/new_table", temp_dir.path().display()))
+                        .schema(table.metadata().current_schema().as_ref().clone())
+                        .build()
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            catalog
+                .register_table(&ident, metadata_location.clone())
+                .await
+                .is_err()
+        );
+        create.assert_async().await;
+
+        let get = server
+            .mock("POST", "/")
+            .match_header("x-amz-target", "AWSGlue.GetTable")
+            .with_status(200)
+            .with_header("content-type", "application/x-amz-json-1.1")
+            .with_body(
+                json!({"Table":{"Name":"table","DatabaseName":"db","VersionId":"1",
+                "Parameters":{"metadata_location":metadata_location}}})
+                .to_string(),
+            )
+            .expect(2)
+            .create_async()
+            .await;
+        let update = server
+            .mock("POST", "/")
+            .match_header("x-amz-target", "AWSGlue.UpdateTable")
+            .with_status(500)
+            .with_header("content-type", "application/x-amz-json-1.1")
+            .with_body(r#"{"__type":"InternalServiceException","Message":"unknown outcome"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let tx = Transaction::new(&table);
+        assert!(
+            tx.update_table_properties()
+                .set("key".into(), "value".into())
+                .apply(tx)
+                .unwrap()
+                .commit(&catalog)
+                .await
+                .is_err()
+        );
+        get.assert_async().await;
+        update.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn single_attempt_policy_is_opt_in_and_rejects_invalid_values() {
+        let server = Server::new_async().await;
+        let temp_dir = TempDir::new().unwrap();
+        let (default, _, _) = test_catalog(&server, &temp_dir).await;
+        let (disabled, _, _) =
+            test_catalog_with_request_policy(&server, &temp_dir, Some("false")).await;
+        let (enabled, _, _) =
+            test_catalog_with_request_policy(&server, &temp_dir, Some("true")).await;
+        assert_eq!(
+            default
+                .client
+                .0
+                .config()
+                .retry_config()
+                .unwrap()
+                .max_attempts(),
+            disabled
+                .client
+                .0
+                .config()
+                .retry_config()
+                .unwrap()
+                .max_attempts()
+        );
+        assert_eq!(
+            enabled
+                .client
+                .0
+                .config()
+                .retry_config()
+                .unwrap()
+                .max_attempts(),
+            1
+        );
+        let invalid = GlueCatalog::new(GlueCatalogConfig {
+            name: Some("invalid".into()),
+            uri: None,
+            catalog_id: None,
+            warehouse: temp_dir.path().display().to_string(),
+            props: HashMap::from([("single-attempt-requests".into(), "TRUE".into())]),
+        })
+        .await;
+        assert_eq!(invalid.unwrap_err().kind(), iceberg::ErrorKind::DataInvalid);
     }
 
     async fn mock_get_table(
