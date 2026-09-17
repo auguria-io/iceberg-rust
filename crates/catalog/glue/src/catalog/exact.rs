@@ -181,14 +181,11 @@ fn before_cas(source: Error) -> ExactCommitError {
     ExactCommitError::before_cas(source)
 }
 
-fn classify_update_error<R>(
-    error: aws_sdk_glue::error::SdkError<UpdateTableError, R>,
+fn classify_update_error(
+    error: aws_sdk_glue::error::SdkError<UpdateTableError>,
     table_ident: &TableIdent,
     staged_metadata_location: String,
-) -> ExactCommitError
-where
-    R: std::fmt::Debug,
-{
+) -> ExactCommitError {
     let source = Error::new(
         ErrorKind::Unexpected,
         format!("Glue exact update failed for table {table_ident}"),
@@ -196,15 +193,14 @@ where
     .with_source(anyhow!("aws sdk error: {error:?}"));
 
     match error.as_service_error() {
-        Some(UpdateTableError::ConcurrentModificationException(_)) => {
+        Some(UpdateTableError::ConcurrentModificationException(_))
+            if crate::error::is_service_rejection(&error) =>
+        {
             ExactCommitError::contended_no_mutation(source)
         }
-        Some(
-            UpdateTableError::AlreadyExistsException(_)
-            | UpdateTableError::EntityNotFoundException(_)
-            | UpdateTableError::InvalidInputException(_)
-            | UpdateTableError::ResourceNumberLimitExceededException(_),
-        ) => ExactCommitError::rejected_no_mutation(source),
+        _ if crate::error::is_service_rejection(&error) => {
+            ExactCommitError::rejected_no_mutation(source)
+        }
         _ if matches!(
             &error,
             aws_sdk_glue::error::SdkError::ConstructionFailure(_)
@@ -222,7 +218,7 @@ mod tests {
 
     use iceberg::spec::{NestedField, PrimitiveType, Schema, TableMetadataBuilder, Type};
     use iceberg::transaction::{ApplyTransactionAction, Transaction};
-    use iceberg::{Catalog, ExactCommitOutcome, MetadataLocation, TableCreation};
+    use iceberg::{Catalog, ExactCommitOutcome, MetadataLocation, NamespaceIdent, TableCreation};
     use mockito::{Matcher, Server};
     use serde_json::json;
     use tempfile::TempDir;
@@ -287,6 +283,7 @@ mod tests {
                 .name(table_ident.name().to_string())
                 .location(table_location.clone())
                 .schema(schema)
+                .properties([("commit.retry.num-retries".to_string(), "0".to_string())])
                 .build(),
         )
         .unwrap()
@@ -321,6 +318,240 @@ mod tests {
 
         assert!(catalog.drop_table(&ident).await.is_err());
         request.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn ordinary_create_marks_only_known_single_attempt_rejections() {
+        for (status, code, policy, expected) in [
+            (400, "ExpiredTokenException", "true", true),
+            (403, "AccessDeniedException", "true", true),
+            (500, "ExpiredTokenException", "true", false),
+            (400, "UnknownFailure", "true", false),
+            (400, "ExpiredTokenException", "false", false),
+        ] {
+            let mut server = Server::new_async().await;
+            let dir = TempDir::new().unwrap();
+            let (catalog, ident, metadata) =
+                test_catalog_with_request_policy(&server, &dir, Some(policy)).await;
+            let get = mock_get_table(&mut server, &ident, metadata, Some("1")).await;
+            let table = catalog.load_table(&ident).await.unwrap();
+            get.assert_async().await;
+            let create = server
+                .mock("POST", "/")
+                .match_header("x-amz-target", "AWSGlue.CreateTable")
+                .with_status(status)
+                .with_header("content-type", "application/x-amz-json-1.1")
+                .with_body(json!({"__type":code,"Message":"ExpiredTokenException"}).to_string())
+                .expect(1)
+                .create_async()
+                .await;
+            let error = catalog
+                .create_table(
+                    ident.namespace(),
+                    TableCreation::builder()
+                        .name("new_table".into())
+                        .location(format!("{}/new_table", dir.path().display()))
+                        .schema(table.metadata().current_schema().as_ref().clone())
+                        .build(),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                crate::is_known_no_catalog_mutation(&error),
+                expected,
+                "{status} {code} {policy}: {error}"
+            );
+            create.assert_async().await;
+        }
+    }
+
+    fn property_transaction(table: &Table) -> Transaction {
+        let tx = Transaction::new(table);
+        tx.update_table_properties()
+            .set("test-key".into(), "value".into())
+            .apply(tx)
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn ordinary_update_settlement_uses_response_code_status_and_actual_retry_policy() {
+        for (status, code, policy, settled, kind) in [
+            (
+                403,
+                "ExpiredTokenException",
+                "true",
+                true,
+                ErrorKind::Unexpected,
+            ),
+            (
+                403,
+                "UnrecognizedClientException",
+                "true",
+                true,
+                ErrorKind::Unexpected,
+            ),
+            (
+                400,
+                "ConcurrentModificationException",
+                "true",
+                true,
+                ErrorKind::CatalogCommitConflicts,
+            ),
+            (
+                500,
+                "ConcurrentModificationException",
+                "true",
+                false,
+                ErrorKind::CatalogCommitConflicts,
+            ),
+            (
+                500,
+                "ExpiredTokenException",
+                "true",
+                false,
+                ErrorKind::Unexpected,
+            ),
+            (400, "UnknownFailure", "true", false, ErrorKind::Unexpected),
+            (
+                403,
+                "ExpiredTokenException",
+                "false",
+                false,
+                ErrorKind::Unexpected,
+            ),
+        ] {
+            let mut server = Server::new_async().await;
+            let temp = TempDir::new().unwrap();
+            let (catalog, ident, metadata) =
+                test_catalog_with_request_policy(&server, &temp, Some(policy)).await;
+            let get = server
+                .mock("POST", "/")
+                .match_header("x-amz-target", "AWSGlue.GetTable")
+                .with_status(200)
+                .with_header("content-type", "application/x-amz-json-1.1")
+                .with_body(
+                    json!({"Table":{"Name":"table","DatabaseName":"db","VersionId":"1",
+                    "Parameters":{"metadata_location":metadata}}})
+                    .to_string(),
+                )
+                .expect(3)
+                .create_async()
+                .await;
+            let table = catalog.load_table(&ident).await.unwrap();
+            let update = server
+                .mock("POST", "/")
+                .match_header("x-amz-target", "AWSGlue.UpdateTable")
+                .with_status(status)
+                .with_header("content-type", "application/x-amz-json-1.1")
+                .with_body(json!({"__type":code,"Message":"request failure"}).to_string())
+                .expect(1)
+                .create_async()
+                .await;
+            let error = property_transaction(&table)
+                .commit(&catalog)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                crate::is_known_no_catalog_mutation(&error),
+                settled,
+                "{status} {code} {policy}: {error}"
+            );
+            assert_eq!(error.kind(), kind);
+            assert_eq!(error.retryable(), kind == ErrorKind::CatalogCommitConflicts);
+            get.assert_async().await;
+            update.assert_async().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn preparation_failures_are_settled_and_send_no_catalog_mutation() {
+        let mut server = Server::new_async().await;
+        let temp = TempDir::new().unwrap();
+        let (catalog, ident, metadata) = test_catalog(&server, &temp).await;
+        let get = mock_get_table(&mut server, &ident, metadata, Some("1")).await;
+        let table = catalog.load_table(&ident).await.unwrap();
+        get.assert_async().await;
+        get.remove_async().await;
+        let create = server
+            .mock("POST", "/")
+            .match_header("x-amz-target", "AWSGlue.CreateTable")
+            .expect(0)
+            .create_async()
+            .await;
+        let update = server
+            .mock("POST", "/")
+            .match_header("x-amz-target", "AWSGlue.UpdateTable")
+            .expect(0)
+            .create_async()
+            .await;
+        let namespace = NamespaceIdent::from_strs(["nested", "namespace"]).unwrap();
+        let error = catalog
+            .create_table(
+                &namespace,
+                TableCreation::builder()
+                    .name("table".into())
+                    .schema(table.metadata().current_schema().as_ref().clone())
+                    .build(),
+            )
+            .await
+            .unwrap_err();
+        assert!(crate::is_known_no_catalog_mutation(&error));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = calls.clone();
+        let metadata = table.metadata_location().unwrap().to_owned();
+        let get = server.mock("POST", "/").match_header("x-amz-target", "AWSGlue.GetTable")
+            .with_status(200).with_header("content-type", "application/x-amz-json-1.1")
+            .with_body_from_request(move |_| {
+                let location = if count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    metadata.clone()
+                } else { "file:///nonexistent/preparation/metadata.json".into() };
+                json!({"Table":{"Name":"table","DatabaseName":"db","VersionId":"1", "Parameters":{"metadata_location":location}}}).to_string().into_bytes()
+            }).expect(2).create_async().await;
+        let error = property_transaction(&table)
+            .commit(&catalog)
+            .await
+            .unwrap_err();
+        assert!(crate::is_known_no_catalog_mutation(&error));
+        get.assert_async().await;
+        create.assert_async().await;
+        update.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn exact_auth_rejections_require_a_known_code_and_client_status() {
+        for (status, code, settled) in [
+            (403, "ExpiredTokenException", true),
+            (500, "ExpiredTokenException", false),
+            (400, "UnknownFailure", false),
+            (500, "ConcurrentModificationException", false),
+        ] {
+            let mut server = Server::new_async().await;
+            let temp = TempDir::new().unwrap();
+            let (catalog, _ident, base) = exact_fixture(&mut server, &temp).await;
+            let update = server
+                .mock("POST", "/")
+                .match_header("x-amz-target", "AWSGlue.UpdateTable")
+                .with_status(status)
+                .with_header("content-type", "application/x-amz-json-1.1")
+                .with_body(json!({"__type":code}).to_string())
+                .expect(1)
+                .create_async()
+                .await;
+            let error = exact_transaction(&base)
+                .commit_exact_base(&catalog, base)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                matches!(error, ExactCommitError::RejectedNoMutation { .. }),
+                settled,
+                "{status} {code}: {error}"
+            );
+            assert_eq!(
+                matches!(error, ExactCommitError::Ambiguous { .. }),
+                !settled
+            );
+            update.assert_async().await;
+        }
     }
 
     #[tokio::test]
