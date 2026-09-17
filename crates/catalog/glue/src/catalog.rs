@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use anyhow::anyhow;
 use async_trait::async_trait;
+use aws_config::retry::RetryConfig;
 use aws_sdk_glue::operation::create_table::CreateTableError;
 use aws_sdk_glue::operation::update_table::UpdateTableError;
 use aws_sdk_glue::types::TableInput;
@@ -51,6 +52,12 @@ pub const GLUE_CATALOG_PROP_URI: &str = "uri";
 pub const GLUE_CATALOG_PROP_CATALOG_ID: &str = "catalog_id";
 /// Glue catalog warehouse location
 pub const GLUE_CATALOG_PROP_WAREHOUSE: &str = "warehouse";
+/// Disable automatic Glue request retries when set to `true` (default: `false`).
+///
+/// This includes reads. Callers that retain exclusion after an uncertain
+/// mutation must not let a later successful SDK retry hide an earlier attempt.
+/// Exact-base updates always disable retries, independently of this setting.
+pub const GLUE_CATALOG_PROP_SINGLE_ATTEMPT_REQUESTS: &str = "single-attempt-requests";
 
 /// Builder for [`GlueCatalog`].
 #[derive(Debug)]
@@ -154,6 +161,17 @@ impl Debug for GlueCatalog {
 impl GlueCatalog {
     /// Create a new glue catalog
     async fn new(config: GlueCatalogConfig) -> Result<Self> {
+        let single_attempt = match config.props.get(GLUE_CATALOG_PROP_SINGLE_ATTEMPT_REQUESTS) {
+            None => false,
+            Some(value) if value == "false" => false,
+            Some(value) if value == "true" => true,
+            Some(_) => {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    "single-attempt-requests must be true or false",
+                ));
+            }
+        };
         let sdk_config = create_sdk_config(&config.props, config.uri.as_ref()).await;
         let mut file_io_props = config.props.clone();
         if !file_io_props.contains_key(S3_ACCESS_KEY_ID)
@@ -185,7 +203,11 @@ impl GlueCatalog {
             file_io_props.insert(S3_ENDPOINT.to_string(), aws_endpoint.to_string());
         }
 
-        let client = aws_sdk_glue::Client::new(&sdk_config);
+        let mut client_config = aws_sdk_glue::config::Builder::from(&sdk_config);
+        if single_attempt {
+            client_config = client_config.retry_config(RetryConfig::disabled());
+        }
+        let client = aws_sdk_glue::Client::from_conf(client_config.build());
 
         let file_io = FileIO::from_path(&config.warehouse)?
             .with_props(file_io_props)
