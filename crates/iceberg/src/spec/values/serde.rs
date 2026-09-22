@@ -21,7 +21,7 @@ pub(crate) mod _serde {
     use std::collections::HashMap;
 
     use serde::de::Visitor;
-    use serde::ser::{SerializeMap, SerializeSeq, SerializeStruct};
+    use serde::ser::{SerializeMap, SerializeSeq};
     use serde::{Deserialize, Serialize};
     use serde_bytes::ByteBuf;
     use serde_derive::{Deserialize as DeserializeDerive, Serialize as SerializeDerive};
@@ -32,7 +32,8 @@ pub(crate) mod _serde {
 
     #[derive(SerializeDerive, DeserializeDerive, Debug, Clone)]
     #[serde(transparent)]
-    /// Raw literal representation used for serde. The serialize way is used for Avro serializer.
+    /// Raw literal representation used for serde. Resolve the serialized Avro
+    /// value against its schema before encoding dynamic record fields.
     pub struct RawLiteral(RawLiteralEnum);
 
     impl RawLiteral {
@@ -73,12 +74,14 @@ pub(crate) mod _serde {
         fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
         where S: serde::Serializer {
             let len = self.required.len() + self.optional.len();
-            let mut record = serializer.serialize_struct("", len)?;
+            // Field names are dynamic, not static Serde struct keys. Avro schema
+            // resolution restores record order before these values are encoded.
+            let mut record = serializer.serialize_map(Some(len))?;
             for (k, v) in &self.required {
-                record.serialize_field(Box::leak(k.clone().into_boxed_str()), &v)?;
+                record.serialize_entry(k, v)?;
             }
             for (k, v) in &self.optional {
-                record.serialize_field(Box::leak(k.clone().into_boxed_str()), &v)?;
+                record.serialize_entry(k, v)?;
             }
             record.end()
         }
