@@ -64,6 +64,11 @@ jobs:
       - uses: actions/checkout@v6
         with:
           token: ${{ secrets.REPO_READONLY }}
+      - name: Authenticate private Cargo dependencies
+        shell: bash
+        env:
+          REPO_READONLY: ${{ secrets.REPO_READONLY }}
+        run: git config --global url."https://${REPO_READONLY}@github.com/".insteadOf https://github.com/
 
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-builder
@@ -104,6 +109,11 @@ jobs:
       - uses: actions/checkout@v6
         with:
           token: ${{ secrets.REPO_READONLY }}
+      - name: Authenticate private Cargo dependencies
+        shell: bash
+        env:
+          REPO_READONLY: ${{ secrets.REPO_READONLY }}
+        run: git config --global url."https://${REPO_READONLY}@github.com/".insteadOf https://github.com/
 
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-builder
@@ -132,6 +142,11 @@ jobs:
       - uses: actions/checkout@v6
         with:
           token: ${{ secrets.REPO_READONLY }}
+      - name: Authenticate private Cargo dependencies
+        shell: bash
+        env:
+          REPO_READONLY: ${{ secrets.REPO_READONLY }}
+        run: git config --global url."https://${REPO_READONLY}@github.com/".insteadOf https://github.com/
 
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-builder
@@ -155,6 +170,11 @@ jobs:
       - uses: actions/checkout@v6
         with:
           token: ${{ secrets.REPO_READONLY }}
+      - name: Authenticate private Cargo dependencies
+        shell: bash
+        env:
+          REPO_READONLY: ${{ secrets.REPO_READONLY }}
+        run: git config --global url."https://${REPO_READONLY}@github.com/".insteadOf https://github.com/
 
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-builder
@@ -201,6 +221,11 @@ jobs:
       - uses: actions/checkout@v6
         with:
           token: ${{ secrets.REPO_READONLY }}
+      - name: Authenticate private Cargo dependencies
+        shell: bash
+        env:
+          REPO_READONLY: ${{ secrets.REPO_READONLY }}
+        run: git config --global url."https://${REPO_READONLY}@github.com/".insteadOf https://github.com/
       - name: Install protoc
         uses: arduino/setup-protoc@v3
         with:
