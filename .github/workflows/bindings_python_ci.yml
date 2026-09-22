@@ -21,6 +21,7 @@ on:
   push:
     branches:
       - main
+      - greed/exact-base-transaction
   pull_request:
     paths:
       - '**'                                       # Include all files and directories in the repository by default.
