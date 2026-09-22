@@ -301,10 +301,7 @@ impl ArrowReader {
                 // Branch 3: no explicit mapping — assign field ids by NAME from
                 // the task schema, recursing through nested types. Replaces the
                 // unsafe positional `addFallbackIds` path.
-                None => assign_field_ids_by_name(
-                    initial_stream_builder.schema(),
-                    task.schema(),
-                ),
+                None => assign_field_ids_by_name(initial_stream_builder.schema(), task.schema()),
             };
 
             let options = ArrowReaderOptions::new().with_schema(arrow_schema);
@@ -373,31 +370,33 @@ impl ArrowReader {
             // column that *is* in parquet would be served as a per-batch constant
             // sourced from the manifest entry, breaking row-level predicate
             // evaluation.
-            let parquet_field_ids: HashSet<i32> = match build_field_id_map(
-                record_batch_stream_builder.parquet_schema(),
-            )? {
-                // File carries embedded field ids — trust them (unchanged).
-                Some(map) => map.keys().copied().collect(),
-                // No embedded ids: the builder's arrow schema now carries the
-                // field ids we assigned BY NAME above (Branch 2/3). Derive the
-                // physically-present set from it rather than from the positional
-                // `build_fallback_field_id_map`. The positional map mis-reported
-                // an out-of-order appended column (e.g. `auguria_event_timestamp`
-                // at the slot of field-id 22) as the partition source field,
-                // which made `with_partition` skip the identity-partition
-                // back-fill and surface a NULL/wrong `product_name`. Name-based
-                // presence keeps genuinely-absent identity columns eligible for
-                // the manifest back-fill (rule #1).
-                None => record_batch_stream_builder
-                    .schema()
-                    .fields()
-                    .iter()
-                    .filter_map(|f| f.metadata().get(PARQUET_FIELD_ID_META_KEY))
-                    .filter_map(|v| v.parse::<i32>().ok())
-                    .collect(),
-            };
-            record_batch_transformer_builder = record_batch_transformer_builder
-                .with_partition(partition_spec, partition_data, &parquet_field_ids)?;
+            let parquet_field_ids: HashSet<i32> =
+                match build_field_id_map(record_batch_stream_builder.parquet_schema())? {
+                    // File carries embedded field ids — trust them (unchanged).
+                    Some(map) => map.keys().copied().collect(),
+                    // No embedded ids: the builder's arrow schema now carries the
+                    // field ids we assigned BY NAME above (Branch 2/3). Derive the
+                    // physically-present set from it rather than from the positional
+                    // `build_fallback_field_id_map`. The positional map mis-reported
+                    // an out-of-order appended column (e.g. `auguria_event_timestamp`
+                    // at the slot of field-id 22) as the partition source field,
+                    // which made `with_partition` skip the identity-partition
+                    // back-fill and surface a NULL/wrong `product_name`. Name-based
+                    // presence keeps genuinely-absent identity columns eligible for
+                    // the manifest back-fill (rule #1).
+                    None => record_batch_stream_builder
+                        .schema()
+                        .fields()
+                        .iter()
+                        .filter_map(|f| f.metadata().get(PARQUET_FIELD_ID_META_KEY))
+                        .filter_map(|v| v.parse::<i32>().ok())
+                        .collect(),
+                };
+            record_batch_transformer_builder = record_batch_transformer_builder.with_partition(
+                partition_spec,
+                partition_data,
+                &parquet_field_ids,
+            )?;
         }
 
         let mut record_batch_transformer = record_batch_transformer_builder.build();
@@ -1196,7 +1195,10 @@ fn apply_name_mapping_to_arrow_schema(
 /// are filtered out during projection); columns genuinely absent from the file
 /// stay eligible for manifest back-fill (rule #1). Corresponds to Java's
 /// recursive `ApplyNameMapping` visitor, using the schema itself as the mapping.
-fn assign_field_ids_by_name(arrow_schema: &ArrowSchemaRef, iceberg_schema: &Schema) -> Arc<ArrowSchema> {
+fn assign_field_ids_by_name(
+    arrow_schema: &ArrowSchemaRef,
+    iceberg_schema: &Schema,
+) -> Arc<ArrowSchema> {
     let fields: Vec<_> = arrow_schema
         .fields()
         .iter()
@@ -1233,9 +1235,9 @@ fn stamp_field_ids_by_name(
                 .map(|c| stamp_field_ids_by_name(c, struct_ty.fields()))
                 .collect(),
         ),
-        (DataType::List(child), Some(Type::List(list_ty))) => {
-            DataType::List(stamp_field_ids_by_name(child, std::slice::from_ref(&list_ty.element_field)))
-        }
+        (DataType::List(child), Some(Type::List(list_ty))) => DataType::List(
+            stamp_field_ids_by_name(child, std::slice::from_ref(&list_ty.element_field)),
+        ),
         (DataType::LargeList(child), Some(Type::List(list_ty))) => DataType::LargeList(
             stamp_field_ids_by_name(child, std::slice::from_ref(&list_ty.element_field)),
         ),
@@ -4164,8 +4166,12 @@ message schema {
                 .with_fields(vec![
                     NestedField::optional(1, "a", Type::Primitive(PrimitiveType::Int)).into(),
                     NestedField::optional(2, "ts", Type::Primitive(PrimitiveType::Long)).into(),
-                    NestedField::optional(3, "product_name", Type::Primitive(PrimitiveType::String))
-                        .into(),
+                    NestedField::optional(
+                        3,
+                        "product_name",
+                        Type::Primitive(PrimitiveType::String),
+                    )
+                    .into(),
                     NestedField::optional(4, "evt", Type::Primitive(PrimitiveType::Long)).into(),
                 ])
                 .build()
@@ -4262,12 +4268,16 @@ message schema {
 
         // evt (id 4) must carry its real values — proving the appended column
         // was bound to id 4 by name, not consumed as product_name (id 3).
-        let evt = batch.column(3).as_primitive::<arrow_array::types::Int64Type>();
+        let evt = batch
+            .column(3)
+            .as_primitive::<arrow_array::types::Int64Type>();
         assert_eq!(evt.value(0), 9_999_000);
         assert_eq!(evt.value(1), 9_999_001);
 
         // ts (id 2) sanity check.
-        let ts = batch.column(1).as_primitive::<arrow_array::types::Int64Type>();
+        let ts = batch
+            .column(1)
+            .as_primitive::<arrow_array::types::Int64Type>();
         assert_eq!(ts.value(0), 100);
         assert_eq!(ts.value(1), 200);
     }

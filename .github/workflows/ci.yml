@@ -15,229 +15,35 @@
 # specific language governing permissions and limitations
 # under the License.
 
+# Builds and runtime tests run in private rust-pkgs CI; see CI_VALIDATION.md.
 name: CI
-
 on:
   push:
-    branches:
-      - main
-      - greed/exact-base-transaction
-      - dev_rebase_main_20260303
+    branches: [main, greed/exact-base-transaction, dev_rebase_main_20260303]
   pull_request:
-    branches:
-      - dev_rebase_main_20260303
-      - greed/exact-base-transaction
-    paths:
-      - '**'                              # Include all files and directories in the repository by default.
-      - '!.github/ISSUE_TEMPLATE/**'      # Exclude files and directories that don't impact tests or code like templates, metadata, and documentation.
-      - '!scripts/**'
-      - '!website/**'
-      - '!.asf.yml'
-      - '!.gitattributes'
-      - '!.gitignore'
-      - '!CONTRIBUTING.md'
-      - '!CHANGELOG.md'
-      - '!LICENSE'
-      - '!NOTICE'
-      - '!README.md'
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
-  cancel-in-progress: true
-
+    branches: [main, greed/exact-base-transaction, dev_rebase_main_20260303]
 permissions:
   contents: read
-
-env:
-  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
-  check:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      max-parallel: 15
-      matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          token: ${{ secrets.REPO_READONLY }}
-      - name: Authenticate private Cargo dependencies
-        shell: bash
-        env:
-          REPO_READONLY: ${{ secrets.REPO_READONLY }}
-        run: git config --global url."https://${REPO_READONLY}@github.com/".insteadOf https://github.com/
-
-      - name: Setup Rust toolchain
-        uses: ./.github/actions/setup-builder
-
-      - name: Check License Header
-        uses: apache/skywalking-eyes/header@v0.8.0
-
-      - name: Check toml format
-        run: make check-toml
-
-      - name: Install protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Cargo format
-        run: make check-fmt
-
-      - name: Check diff
-        run: git diff --exit-code
-
-      - name: Cargo clippy
-        run: make check-clippy
-
-      - name: Cargo Machete
-        run: make cargo-machete
-
-  build:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      max-parallel: 15
-      matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-          - windows-latest
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          token: ${{ secrets.REPO_READONLY }}
-      - name: Authenticate private Cargo dependencies
-        shell: bash
-        env:
-          REPO_READONLY: ${{ secrets.REPO_READONLY }}
-        run: git config --global url."https://${REPO_READONLY}@github.com/".insteadOf https://github.com/
-
-      - name: Setup Rust toolchain
-        uses: ./.github/actions/setup-builder
-
-      - name: Cache Rust artifacts
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build
-        run: make build
-
-  build_with_no_default_features:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      max-parallel: 15
-      matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-          - windows-latest
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          token: ${{ secrets.REPO_READONLY }}
-      - name: Authenticate private Cargo dependencies
-        shell: bash
-        env:
-          REPO_READONLY: ${{ secrets.REPO_READONLY }}
-        run: git config --global url."https://${REPO_READONLY}@github.com/".insteadOf https://github.com/
-
-      - name: Setup Rust toolchain
-        uses: ./.github/actions/setup-builder
-
-      - name: Cache Rust artifacts
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build
-        run: cargo build -p iceberg --no-default-features
-
-  tests:
+  public-format:
+    name: Public Rust and TOML formatting (not runtime tests)
     runs-on: ubuntu-latest
-    strategy:
-      max-parallel: 15
-      matrix:
-        test-suite:
-          - { name: "default", args: "--all-targets --all-features --workspace" }
-          - { name: "doc", args: "--doc --all-features --workspace" }
-    name: Tests (${{ matrix.test-suite.name }})
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
         with:
-          token: ${{ secrets.REPO_READONLY }}
-      - name: Authenticate private Cargo dependencies
-        shell: bash
-        env:
-          REPO_READONLY: ${{ secrets.REPO_READONLY }}
-        run: git config --global url."https://${REPO_READONLY}@github.com/".insteadOf https://github.com/
-
-      - name: Setup Rust toolchain
+          persist-credentials: false
+      - name: Setup repository Rust toolchain
         uses: ./.github/actions/setup-builder
-
-      - name: Install protoc
-        uses: arduino/setup-protoc@v3
+      - uses: taiki-e/install-action@v2
         with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Cache Rust artifacts
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.test-suite.name }}
-
-      - name: Install cargo-nextest
-        if: matrix.test-suite.name == 'default'
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-nextest
-
-      - name: Start Docker containers
-        if: matrix.test-suite.name == 'default'
-        run: make docker-up
-
-      - name: Run tests
-        env:
-          # Disable debug info to speed up compilation and reduce artifact size
-          RUSTFLAGS: "-C debuginfo=0"
+          tool: taplo-cli@0.9.3
+      - run: cargo fmt --all -- --check
+      - run: taplo check
+      - name: Explain separate runtime validation
         run: |
-          if [ "${{ matrix.test-suite.name }}" = "default" ]; then
-            cargo nextest run ${{ matrix.test-suite.args }}
-          else
-            cargo test --no-fail-fast ${{ matrix.test-suite.args }}
-          fi
-
-      - name: Stop Docker containers
-        if: always() && matrix.test-suite.name == 'default'
-        run: make docker-down
-
-  msrv:
-    name: Verify MSRV
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          token: ${{ secrets.REPO_READONLY }}
-      - name: Authenticate private Cargo dependencies
-        shell: bash
-        env:
-          REPO_READONLY: ${{ secrets.REPO_READONLY }}
-        run: git config --global url."https://${REPO_READONLY}@github.com/".insteadOf https://github.com/
-      - name: Install protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Get MSRV
-        id: get-msrv
-        uses: ./.github/actions/get-msrv
-      - name: Setup MSRV Rust toolchain
-        uses: ./.github/actions/setup-builder
-        with:
-          rust-version: ${{ steps.get-msrv.outputs.msrv }}
-      - name: Setup Nightly Rust toolchain
-        uses: ./.github/actions/setup-builder
-      - name: Check MSRV
-        run: make check-msrv
+          echo 'Public formatting passed. This does not validate builds or runtime behaviour.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Before merge, review the private Fork Dependency Validation run for this exact commit; see CI_VALIDATION.md.' >> "$GITHUB_STEP_SUMMARY"

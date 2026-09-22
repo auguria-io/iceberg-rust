@@ -44,99 +44,24 @@ concurrency:
 permissions:
   contents: read
 
-env:
-  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-
+# Runtime extension tests run in private rust-pkgs CI; see CI_VALIDATION.md.
 jobs:
-  check-rust:
+  public-python-static:
+    name: Public Python formatting and lint (not extension tests)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
         with:
-          token: ${{ secrets.REPO_READONLY }}
-      - name: Authenticate private Cargo dependencies
-        shell: bash
-        env:
-          REPO_READONLY: ${{ secrets.REPO_READONLY }}
-        run: git config --global url."https://${REPO_READONLY}@github.com/".insteadOf https://github.com/
-      - name: Check format
-        working-directory: "bindings/python"
-        run: cargo fmt --all -- --check
-      - name: Check clippy
-        working-directory: "bindings/python"
-        run: cargo clippy --all-targets --all-features -- -D warnings
-
-  check-python:
-    runs-on: ubuntu-slim
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          token: ${{ secrets.REPO_READONLY }}
-      - name: Authenticate private Cargo dependencies
-        shell: bash
-        env:
-          REPO_READONLY: ${{ secrets.REPO_READONLY }}
-        run: git config --global url."https://${REPO_READONLY}@github.com/".insteadOf https://github.com/
+          persist-credentials: false
+      - uses: ./.github/actions/setup-builder
       - uses: astral-sh/setup-uv@v7
         with:
           version: "0.9.3"
-          enable-cache: true
-      - name: Install tools
-        run: |
-          uv tool install ruff
-      - name: Check format
-        working-directory: "bindings/python"
-        run: |
-          uvx ruff format . --diff
-      - name: Check style
-        working-directory: "bindings/python"
-        run: |
-          uvx ruff check .
-
-  test:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      max-parallel: 15
-      matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-          - windows-latest
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          token: ${{ secrets.REPO_READONLY }}
-      - name: Authenticate private Cargo dependencies
-        shell: bash
-        env:
-          REPO_READONLY: ${{ secrets.REPO_READONLY }}
-        run: git config --global url."https://${REPO_READONLY}@github.com/".insteadOf https://github.com/
-      - uses: actions/setup-python@v6
-        with:
-          python-version: 3.12
-      - uses: PyO3/maturin-action@v1
-        with:
-          working-directory: "bindings/python"
-          command: build
-          # Test wheels run on this runner; keep checkout credentials available.
-          manylinux: off
-          args: --out dist
-      - uses: astral-sh/setup-uv@v7
-        with:
-          version: "0.9.3"
-          enable-cache: true
-      - name: Sync dependencies
-        working-directory: "bindings/python"
-        shell: bash
-        run: |
-          make install
-      - name: Install built wheel
-        working-directory: "bindings/python"
-        shell: bash
-        run: |
-          uv pip install --reinstall dist/pyiceberg_core-*.whl
-      - name: Run tests
-        working-directory: "bindings/python"
-        shell: bash
-        run: |
-          make test
+          enable-cache: false
+      - run: cargo fmt --all -- --check
+        working-directory: bindings/python
+      - run: uvx ruff format . --check
+        working-directory: bindings/python
+      - run: uvx ruff check .
+        working-directory: bindings/python

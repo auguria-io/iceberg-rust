@@ -1777,10 +1777,9 @@ mod test {
             .expect("with_partition should accept the virtual column path")
             .build();
 
-        let file_batch = RecordBatch::try_new(
-            file_schema,
-            vec![Arc::new(Int32Array::from(vec![10, 20, 30]))],
-        )
+        let file_batch = RecordBatch::try_new(file_schema, vec![Arc::new(Int32Array::from(vec![
+            10, 20, 30,
+        ]))])
         .unwrap();
 
         let result = transformer.process_record_batch(file_batch).unwrap();
@@ -1859,11 +1858,9 @@ mod test {
             .unwrap()
             .build();
 
-        let file_batch = RecordBatch::try_new(
-            file_schema,
-            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
-        )
-        .unwrap();
+        let file_batch =
+            RecordBatch::try_new(file_schema, vec![Arc::new(Int32Array::from(vec![1, 2, 3]))])
+                .unwrap();
 
         let result = transformer.process_record_batch(file_batch).unwrap();
         let x_col = result
@@ -1936,7 +1933,11 @@ mod test {
         // File B: product_name PRESENT in parquet → read through as flat Utf8.
         let mut transformer_b =
             RecordBatchTransformerBuilder::new(schema.clone(), &projected_field_ids)
-                .with_partition(partition_spec, partition_data, &[1, 2].into_iter().collect())
+                .with_partition(
+                    partition_spec,
+                    partition_data,
+                    &[1, 2].into_iter().collect(),
+                )
                 .unwrap()
                 .build();
         let batch_b = RecordBatch::try_new(
