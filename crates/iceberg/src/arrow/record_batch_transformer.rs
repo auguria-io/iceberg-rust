@@ -1799,20 +1799,29 @@ mod test {
         // must materialize as the canonical flat Utf8 — NOT RunEndEncoded — so a
         // backfilled file can concat with a file that stores the column physically
         // (plan-46 Task 7).
-        let pn_col = result.column(1);
+        let product_name_column = result.column(1);
         assert_eq!(
-            pn_col.data_type(),
+            product_name_column.data_type(),
             &DataType::Utf8,
             "partition constant must be flat Utf8, not RunEndEncoded, so cross-file concat works"
         );
         assert!(
-            pn_col.as_any().downcast_ref::<StringArray>().is_some(),
+            product_name_column
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .is_some(),
             "expected a flat StringArray for the backfilled partition constant"
         );
-        let extracted = get_string_value(pn_col, 0);
+        let extracted = get_string_value(product_name_column, 0);
         assert_eq!(extracted, "cisco_meraki_events");
-        assert_eq!(get_string_value(pn_col, 1), "cisco_meraki_events");
-        assert_eq!(get_string_value(pn_col, 2), "cisco_meraki_events");
+        assert_eq!(
+            get_string_value(product_name_column, 1),
+            "cisco_meraki_events"
+        );
+        assert_eq!(
+            get_string_value(product_name_column, 2),
+            "cisco_meraki_events"
+        );
     }
 
     /// Regression test mirror: when the parquet *does* carry the

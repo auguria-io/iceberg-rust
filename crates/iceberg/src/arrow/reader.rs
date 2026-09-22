@@ -281,7 +281,7 @@ impl ArrowReader {
             // schema-evolving writer can omit a column mid-schema and append
             // later ones. The previous position-based fallback
             // (`addFallbackIds`: physical column N → field-id N+1) silently
-            // mis-bound columns in that case. Observed on golden
+            // incorrectly bound columns in that case. Observed on golden
             // `cisco_asa`: files that omit `product_name` (field-id 22) and
             // append `auguria_event_timestamp` get physical
             // `auguria_event_timestamp` at the position where field-id 22 would
@@ -334,7 +334,7 @@ impl ArrowReader {
         // schema (`record_batch_stream_builder.schema()`) carries the correct
         // IDs in physical-column order. Position-based projection
         // (`field-id N → column N-1`) is never used in the read path — it
-        // mis-binds columns whenever physical order diverges from field-id
+        // incorrectly binds columns whenever physical order diverges from field-id
         // order, the same root cause as the name-mapping change above.
         let projection_mask = Self::get_arrow_projection_mask(
             &project_field_ids_without_metadata,
@@ -377,7 +377,7 @@ impl ArrowReader {
                     // No embedded ids: the builder's arrow schema now carries the
                     // field ids we assigned BY NAME above (Branch 2/3). Derive the
                     // physically-present set from it rather than from the positional
-                    // `build_fallback_field_id_map`. The positional map mis-reported
+                    // `build_fallback_field_id_map`. The positional map incorrectly reported
                     // an out-of-order appended column (e.g. `auguria_event_timestamp`
                     // at the slot of field-id 22) as the partition source field,
                     // which made `with_partition` skip the identity-partition
@@ -1172,7 +1172,7 @@ fn apply_name_mapping_to_arrow_schema(
 
 // NOTE: the former `add_fallback_field_ids_to_arrow_schema` (position-based
 // fallback: physical column N → field-id N+1) was removed in favor of
-// `assign_field_ids_by_name`. Position-based assignment silently mis-binds
+// `assign_field_ids_by_name`. Position-based assignment silently incorrectly binds
 // columns when a file's physical order diverges from field-id order (a
 // schema-evolving writer omitting/appending columns), which is exactly the
 // golden `cisco_asa` corruption plan-46 Task 14 fixed. Name-based resolution
@@ -1187,7 +1187,7 @@ fn apply_name_mapping_to_arrow_schema(
 /// is correct even when the file's physical column order diverges from field-id
 /// order — e.g. a schema-evolving writer that omits a column mid-schema and
 /// appends new ones. The previous position-based fallback (physical column N →
-/// field-id N+1) silently mis-bound columns in that case (observed on golden
+/// field-id N+1) silently incorrectly bound columns in that case (observed on golden
 /// `cisco_asa`: physical `auguria_event_timestamp` at the slot of field-id 22
 /// was served as the `product_name` identity partition).
 ///
