@@ -67,7 +67,6 @@ Iceberg Rust provides various storage backends through feature flags. Here are t
 | Memory               | `storage-memory` | ✅ Stable       | In-memory storage for testing and development |
 | Local Filesystem     | `storage-fs`     | ✅ Stable       | Local filesystem storage                      |
 | Amazon S3            | `storage-s3`     | ✅ Stable       | Amazon S3 storage                             |
-| Google Cloud Storage | `storage-gcs`    | ✅ Stable       | Google Cloud Storage                          |
 | Alibaba Cloud OSS    | `storage-oss`    | 🧪 Experimental | Alibaba Cloud Object Storage Service          |
 | Azure Datalake       | `storage-azdls`  | 🧪 Experimental | Azure Datalake Storage v2                     |
 
@@ -81,3 +80,5 @@ Example usage in `Cargo.toml`:
 [dependencies]
 iceberg = { version = "x.y.z", features = ["storage-s3", "storage-fs"] }
 ```
+
+This Auguria fork does not include Google Cloud Storage support. Production consumers use AWS, Azure and local storage; removing the unused Google backend avoids retaining its legacy signing dependency.
