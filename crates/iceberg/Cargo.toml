@@ -30,16 +30,14 @@ repository = { workspace = true }
 
 [features]
 default = ["storage-memory", "storage-fs", "storage-s3"]
-storage-all = ["storage-memory", "storage-fs", "storage-s3", "storage-gcs", "storage-azblob"]
+storage-all = ["storage-memory", "storage-fs", "storage-s3", "storage-azblob"]
 
+storage-azblob = ["opendal/services-azblob"]
 storage-azdls = ["opendal/services-azdls"]
 storage-fs = ["opendal/services-fs"]
-storage-gcs = ["opendal/services-gcs"]
 storage-memory = ["opendal/services-memory"]
 storage-oss = ["opendal/services-oss"]
 storage-s3 = ["opendal/services-s3", "reqsign"]
-storage-azblob = ["opendal/services-azblob"]
-
 
 [dependencies]
 anyhow = { workspace = true }
@@ -64,9 +62,11 @@ chrono = { workspace = true }
 crc32fast = { workspace = true }
 derive_builder = { workspace = true }
 expect-test = { workspace = true }
+fastnum = { workspace = true }
 flate2 = { workspace = true }
 fnv = { workspace = true }
 futures = { workspace = true }
+hashbrown = "0.17.0"
 itertools = { workspace = true }
 moka = { version = "0.12.10", features = ["future"] }
 murmur3 = { workspace = true }
@@ -78,7 +78,6 @@ rand = { workspace = true }
 reqsign = { version = "0.16.3", optional = true, default-features = false }
 reqwest = { workspace = true }
 roaring = { workspace = true }
-fastnum = { workspace = true }
 serde = { workspace = true }
 serde_bytes = { workspace = true }
 serde_derive = { workspace = true }
@@ -93,18 +92,17 @@ typetag = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
 zstd = { workspace = true }
-hashbrown = "0.17.0"
 
 [dev-dependencies]
 allocation-counter = "0.8"
 expect-test = { workspace = true }
 iceberg_test_utils = { path = "../test_utils", features = ["tests"] }
+minijinja = { workspace = true }
 mockall = { workspace = true }
 pretty_assertions = { workspace = true }
 rand = { workspace = true }
 regex = { workspace = true }
 tempfile = { workspace = true }
-minijinja = { workspace = true }
 
 [package.metadata.cargo-machete]
 # These dependencies are added to ensure minimal dependency version
