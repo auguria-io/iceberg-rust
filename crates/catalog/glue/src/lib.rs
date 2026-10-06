@@ -45,6 +45,7 @@
 
 mod catalog;
 mod error;
+pub use error::is_known_no_catalog_mutation;
 mod schema;
 mod utils;
 pub use catalog::*;

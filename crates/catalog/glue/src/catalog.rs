@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use anyhow::anyhow;
 use async_trait::async_trait;
+use aws_config::retry::RetryConfig;
 use aws_sdk_glue::operation::create_table::CreateTableError;
 use aws_sdk_glue::operation::update_table::UpdateTableError;
 use aws_sdk_glue::types::TableInput;
@@ -34,7 +35,7 @@ use iceberg::{
     Namespace, NamespaceIdent, Result, TableCommit, TableCreation, TableIdent,
 };
 
-use crate::error::{from_aws_build_error, from_aws_sdk_error};
+use crate::error::{from_aws_build_error, from_aws_sdk_error, mutation_error, no_catalog_mutation};
 use crate::utils::{
     convert_to_database, convert_to_glue_table, convert_to_namespace, create_sdk_config,
     get_default_table_location, get_metadata_location, validate_namespace,
@@ -51,6 +52,12 @@ pub const GLUE_CATALOG_PROP_URI: &str = "uri";
 pub const GLUE_CATALOG_PROP_CATALOG_ID: &str = "catalog_id";
 /// Glue catalog warehouse location
 pub const GLUE_CATALOG_PROP_WAREHOUSE: &str = "warehouse";
+/// Disable automatic Glue request retries when set to `true` (default: `false`).
+///
+/// This includes reads. Callers that retain exclusion after an uncertain
+/// mutation must not let a later successful SDK retry hide an earlier attempt.
+/// Exact-base updates always disable retries, independently of this setting.
+pub const GLUE_CATALOG_PROP_SINGLE_ATTEMPT_REQUESTS: &str = "single-attempt-requests";
 
 /// Builder for [`GlueCatalog`].
 #[derive(Debug)]
@@ -152,8 +159,27 @@ impl Debug for GlueCatalog {
 }
 
 impl GlueCatalog {
+    fn single_attempt_requests(&self) -> bool {
+        self.client
+            .0
+            .config()
+            .retry_config()
+            .is_some_and(|retry| retry.max_attempts() == 1)
+    }
+
     /// Create a new glue catalog
     async fn new(config: GlueCatalogConfig) -> Result<Self> {
+        let single_attempt = match config.props.get(GLUE_CATALOG_PROP_SINGLE_ATTEMPT_REQUESTS) {
+            None => false,
+            Some(value) if value == "false" => false,
+            Some(value) if value == "true" => true,
+            Some(_) => {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    "single-attempt-requests must be true or false",
+                ));
+            }
+        };
         let sdk_config = create_sdk_config(&config.props, config.uri.as_ref()).await;
         let mut file_io_props = config.props.clone();
         if !file_io_props.contains_key(S3_ACCESS_KEY_ID)
@@ -185,7 +211,11 @@ impl GlueCatalog {
             file_io_props.insert(S3_ENDPOINT.to_string(), aws_endpoint.to_string());
         }
 
-        let client = aws_sdk_glue::Client::new(&sdk_config);
+        let mut client_config = aws_sdk_glue::config::Builder::from(&sdk_config);
+        if single_attempt {
+            client_config = client_config.retry_config(RetryConfig::disabled());
+        }
+        let client = aws_sdk_glue::Client::from_conf(client_config.build());
 
         let file_io = FileIO::from_path(&config.warehouse)?
             .with_props(file_io_props)
@@ -516,34 +546,44 @@ impl Catalog for GlueCatalog {
         namespace: &NamespaceIdent,
         mut creation: TableCreation,
     ) -> Result<Table> {
-        let db_name = validate_namespace(namespace)?;
-        let table_name = creation.name.clone();
+        let (db_name, table_name, metadata_location, metadata, glue_table) = async {
+            let db_name = validate_namespace(namespace)?;
+            let table_name = creation.name.clone();
 
-        let location = match &creation.location {
-            Some(location) => location.clone(),
-            None => {
-                let ns = self.get_namespace(namespace).await?;
-                let location =
-                    get_default_table_location(&ns, &db_name, &table_name, &self.config.warehouse);
-                creation.location = Some(location.clone());
-                location
-            }
-        };
-        let metadata = TableMetadataBuilder::from_table_creation(creation)?
-            .build()?
-            .metadata;
-        let metadata_location =
-            MetadataLocation::new_with_table_location(location.clone()).to_string();
+            let location = match &creation.location {
+                Some(location) => location.clone(),
+                None => {
+                    let ns = self.get_namespace(namespace).await?;
+                    let location = get_default_table_location(
+                        &ns,
+                        &db_name,
+                        &table_name,
+                        &self.config.warehouse,
+                    );
+                    creation.location = Some(location.clone());
+                    location
+                }
+            };
+            let metadata = TableMetadataBuilder::from_table_creation(creation)?
+                .build()?
+                .metadata;
+            let metadata_location =
+                MetadataLocation::new_with_table_location(location.clone()).to_string();
 
-        metadata.write_to(&self.file_io, &metadata_location).await?;
+            metadata.write_to(&self.file_io, &metadata_location).await?;
 
-        let glue_table = convert_to_glue_table(
-            &table_name,
-            metadata_location.clone(),
-            &metadata,
-            metadata.properties(),
-            None,
-        )?;
+            let glue_table = convert_to_glue_table(
+                &table_name,
+                metadata_location.clone(),
+                &metadata,
+                metadata.properties(),
+                None,
+            )?;
+
+            Ok::<_, Error>((db_name, table_name, metadata_location, metadata, glue_table))
+        }
+        .await
+        .map_err(no_catalog_mutation)?;
 
         let builder = self
             .client
@@ -553,7 +593,14 @@ impl Catalog for GlueCatalog {
             .table_input(glue_table);
         let builder = with_catalog_id!(builder, self.config);
 
-        builder.send().await.map_err(from_aws_sdk_error)?;
+        builder.send().await.map_err(|error| {
+            mutation_error(
+                error,
+                self.single_attempt_requests(),
+                ErrorKind::Unexpected,
+                false,
+            )
+        })?;
 
         Table::builder()
             .file_io(self.file_io())
@@ -788,60 +835,58 @@ impl Catalog for GlueCatalog {
 
     async fn update_table(&self, commit: TableCommit) -> Result<Table> {
         let table_ident = commit.identifier().clone();
-        let table_namespace = validate_namespace(table_ident.namespace())?;
+        let (staged_table, builder) = async {
+            let table_namespace = validate_namespace(table_ident.namespace())?;
 
-        let (current_table, current_version_id) =
-            self.load_table_with_version_id(&table_ident).await?;
-        let current_metadata_location = current_table.metadata_location_result()?.to_string();
+            let (current_table, current_version_id) =
+                self.load_table_with_version_id(&table_ident).await?;
+            let current_metadata_location = current_table.metadata_location_result()?.to_string();
 
-        let staged_table = commit.apply(current_table)?;
-        let staged_metadata_location = staged_table.metadata_location_result()?;
+            let staged_table = commit.apply(current_table)?;
+            let staged_metadata_location = staged_table.metadata_location_result()?;
 
-        // Write new metadata
-        staged_table
-            .metadata()
-            .write_to(staged_table.file_io(), staged_metadata_location)
-            .await?;
+            // Write new metadata
+            staged_table
+                .metadata()
+                .write_to(staged_table.file_io(), staged_metadata_location)
+                .await?;
 
-        // Persist staged table to Glue with optimistic locking
-        let mut builder = self
-            .client
-            .0
-            .update_table()
-            .database_name(table_namespace)
-            .set_skip_archive(Some(true)) // todo make this configurable
-            .table_input(convert_to_glue_table(
-                table_ident.name(),
-                staged_metadata_location.to_string(),
-                staged_table.metadata(),
-                staged_table.metadata().properties(),
-                Some(current_metadata_location),
-            )?);
+            // Persist staged table to Glue with optimistic locking
+            let mut builder = self
+                .client
+                .0
+                .update_table()
+                .database_name(table_namespace)
+                .set_skip_archive(Some(true)) // todo make this configurable
+                .table_input(convert_to_glue_table(
+                    table_ident.name(),
+                    staged_metadata_location.to_string(),
+                    staged_table.metadata(),
+                    staged_table.metadata().properties(),
+                    Some(current_metadata_location),
+                )?);
 
-        // Add VersionId for optimistic locking
-        if let Some(version_id) = current_version_id {
-            builder = builder.version_id(version_id);
-        }
-
-        let builder = with_catalog_id!(builder, self.config);
-        let _ = builder.send().await.map_err(|e| {
-            let error = e.into_service_error();
-            match error {
-                UpdateTableError::EntityNotFoundException(_) => Error::new(
-                    ErrorKind::TableNotFound,
-                    format!("Table {table_ident} is not found"),
-                ),
-                UpdateTableError::ConcurrentModificationException(_) => Error::new(
-                    ErrorKind::CatalogCommitConflicts,
-                    format!("Commit failed for table: {table_ident}"),
-                )
-                .with_retryable(true),
-                _ => Error::new(
-                    ErrorKind::Unexpected,
-                    format!("Operation failed for table: {table_ident} for hitting aws sdk error"),
-                ),
+            // Add VersionId for optimistic locking
+            if let Some(version_id) = current_version_id {
+                builder = builder.version_id(version_id);
             }
-            .with_source(anyhow!("aws sdk error: {error:?}"))
+
+            let builder = with_catalog_id!(builder, self.config);
+            Ok::<_, Error>((staged_table, builder))
+        }
+        .await
+        .map_err(no_catalog_mutation)?;
+        let _ = builder.send().await.map_err(|e| {
+            let (kind, retryable) = match e.as_service_error() {
+                Some(UpdateTableError::EntityNotFoundException(_)) => {
+                    (ErrorKind::TableNotFound, false)
+                }
+                Some(UpdateTableError::ConcurrentModificationException(_)) => {
+                    (ErrorKind::CatalogCommitConflicts, true)
+                }
+                _ => (ErrorKind::Unexpected, false),
+            };
+            mutation_error(e, self.single_attempt_requests(), kind, retryable)
         })?;
 
         Ok(staged_table)
