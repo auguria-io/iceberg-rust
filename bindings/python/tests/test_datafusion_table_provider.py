@@ -67,9 +67,9 @@ def arrow_table_with_null() -> "pa.Table":
             "double": [0.0, None, 0.9],
             # 'time': [1_000_000, None, 3_000_000],  # Example times: 1s, none, and 3s past midnight #Spark does not support time fields
             "timestamp": [
-                datetime(2023, 1, 1, 19, 25, 00),  # noqa: DTZ001 - exercise timestamp without a timezone
+                datetime(2023, 1, 1, 19, 25, 00),  # naive timestamp fixture
                 None,
-                datetime(2023, 3, 1, 19, 25, 00),  # noqa: DTZ001 - exercise timestamp without a timezone
+                datetime(2023, 3, 1, 19, 25, 00),  # naive timestamp fixture
             ],
             # "timestamptz": [
             #     datetime(2023, 1, 1, 19, 25, 00, tzinfo=timezone.utc),
