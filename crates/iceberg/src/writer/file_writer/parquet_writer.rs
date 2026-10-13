@@ -696,10 +696,7 @@ fn normalize_batch_to_schema(
     batch: &RecordBatch,
     target_schema: &ArrowSchemaRef,
 ) -> Result<RecordBatch> {
-    let pair_count = batch
-        .columns()
-        .len()
-        .min(target_schema.fields().len());
+    let pair_count = batch.columns().len().min(target_schema.fields().len());
     let mut needs_normalization = false;
     for i in 0..pair_count {
         if batch.column(i).data_type() != target_schema.field(i).data_type() {
@@ -716,9 +713,7 @@ fn normalize_batch_to_schema(
         Vec::with_capacity(batch_schema.fields().len());
     let mut new_columns: Vec<ArrayRef> = Vec::with_capacity(batch.columns().len());
     for i in 0..batch.columns().len() {
-        if i < pair_count
-            && batch.column(i).data_type() != target_schema.field(i).data_type()
-        {
+        if i < pair_count && batch.column(i).data_type() != target_schema.field(i).data_type() {
             let target_field = target_schema.field(i);
             let cast_col = cast(batch.column(i), target_field.data_type()).map_err(|e| {
                 Error::new(
@@ -2010,11 +2005,8 @@ mod tests {
         let location_gen = DefaultLocationGenerator::with_data_location(
             temp_dir.path().to_str().unwrap().to_string(),
         );
-        let file_name_gen = DefaultFileNameGenerator::new(
-            "ree_input".to_string(),
-            None,
-            DataFileFormat::Parquet,
-        );
+        let file_name_gen =
+            DefaultFileNameGenerator::new("ree_input".to_string(), None, DataFileFormat::Parquet);
 
         // Iceberg schema declares `product_name` as canonical Utf8.
         let iceberg_schema = Arc::new(
@@ -2051,16 +2043,13 @@ mod tests {
             ),
         ]));
         let id_col = Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef;
-        let to_write =
-            RecordBatch::try_new(arrow_schema_in, vec![id_col, ree_array]).unwrap();
+        let to_write = RecordBatch::try_new(arrow_schema_in, vec![id_col, ree_array]).unwrap();
 
-        let file_path =
-            location_gen.generate_location(None, &file_name_gen.generate_file_name());
+        let file_path = location_gen.generate_location(None, &file_name_gen.generate_file_name());
         let output_file = file_io.new_output(&file_path)?;
-        let mut pw =
-            ParquetWriterBuilder::new(WriterProperties::builder().build(), iceberg_schema)
-                .build(output_file)
-                .await?;
+        let mut pw = ParquetWriterBuilder::new(WriterProperties::builder().build(), iceberg_schema)
+            .build(output_file)
+            .await?;
         pw.write(&to_write).await?;
         let _data_files = pw.close().await?;
 

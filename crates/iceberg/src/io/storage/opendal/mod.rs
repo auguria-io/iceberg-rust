@@ -31,8 +31,6 @@ use opendal::layers::{RetryLayer, TimeoutLayer};
 use opendal::services::AzblobConfig;
 #[cfg(feature = "storage-azdls")]
 use opendal::services::AzdlsConfig;
-#[cfg(feature = "storage-gcs")]
-use opendal::services::GcsConfig;
 #[cfg(feature = "storage-oss")]
 use opendal::services::OssConfig;
 #[cfg(feature = "storage-s3")]
@@ -53,8 +51,6 @@ use crate::{Error, ErrorKind, Result};
 mod azdls;
 #[cfg(feature = "storage-fs")]
 mod fs;
-#[cfg(feature = "storage-gcs")]
-mod gcs;
 #[cfg(feature = "storage-memory")]
 mod memory;
 #[cfg(feature = "storage-oss")]
@@ -66,8 +62,6 @@ mod s3;
 use azdls::*;
 #[cfg(feature = "storage-fs")]
 use fs::*;
-#[cfg(feature = "storage-gcs")]
-use gcs::*;
 #[cfg(feature = "storage-memory")]
 use memory::*;
 #[cfg(feature = "storage-oss")]
@@ -95,9 +89,6 @@ pub enum OpenDalStorageFactory {
         #[serde(skip)]
         customized_credential_load: Option<CustomAwsCredentialLoader>,
     },
-    /// GCS storage factory.
-    #[cfg(feature = "storage-gcs")]
-    Gcs,
     /// Azure Blob Storage factory.
     #[cfg(feature = "storage-azblob")]
     Azblob,
@@ -131,10 +122,6 @@ impl StorageFactory for OpenDalStorageFactory {
                 config: s3_config_parse(config.props().clone())?.into(),
                 customized_credential_load: customized_credential_load.clone(),
             })),
-            #[cfg(feature = "storage-gcs")]
-            OpenDalStorageFactory::Gcs => Ok(Arc::new(OpenDalStorage::Gcs {
-                config: gcs_config_parse(config.props().clone())?.into(),
-            })),
             #[cfg(feature = "storage-azblob")]
             OpenDalStorageFactory::Azblob => Ok(Arc::new(OpenDalStorage::Azblob {
                 config: crate::io::azblob_config_parse(config.props().clone())?.into(),
@@ -154,7 +141,6 @@ impl StorageFactory for OpenDalStorageFactory {
                 not(feature = "storage-memory"),
                 not(feature = "storage-fs"),
                 not(feature = "storage-s3"),
-                not(feature = "storage-gcs"),
                 not(feature = "storage-azblob"),
                 not(feature = "storage-oss"),
                 not(feature = "storage-azdls"),
@@ -193,12 +179,6 @@ pub enum OpenDalStorage {
         /// Custom AWS credential loader.
         #[serde(skip)]
         customized_credential_load: Option<CustomAwsCredentialLoader>,
-    },
-    /// GCS storage variant.
-    #[cfg(feature = "storage-gcs")]
-    Gcs {
-        /// GCS configuration.
-        config: Arc<GcsConfig>,
     },
     /// AZBLOB storage variant.
     #[cfg(feature = "storage-azblob")]
@@ -249,10 +229,6 @@ impl OpenDalStorage {
                 customized_credential_load: extensions
                     .get::<CustomAwsCredentialLoader>()
                     .map(Arc::unwrap_or_clone),
-            }),
-            #[cfg(feature = "storage-gcs")]
-            Scheme::Gcs => Ok(Self::Gcs {
-                config: gcs_config_parse(props)?.into(),
             }),
             #[cfg(feature = "storage-azblob")]
             Scheme::Azblob => Ok(Self::Azblob {
@@ -345,19 +321,6 @@ impl OpenDalStorage {
                     ));
                 }
             }
-            #[cfg(feature = "storage-gcs")]
-            OpenDalStorage::Gcs { config } => {
-                let operator = gcs_config_build(config, path)?;
-                let prefix = format!("gs://{}/", operator.info().name());
-                if path.starts_with(&prefix) {
-                    (operator, &path[prefix.len()..])
-                } else {
-                    return Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        format!("Invalid gcs url: {path}, should start with {prefix}"),
-                    ));
-                }
-            }
             #[cfg(feature = "storage-azblob")]
             OpenDalStorage::Azblob { config } => {
                 let operator = crate::io::azblob_config_build(config, path)?;
@@ -392,7 +355,6 @@ impl OpenDalStorage {
             #[cfg(all(
                 not(feature = "storage-s3"),
                 not(feature = "storage-fs"),
-                not(feature = "storage-gcs"),
                 not(feature = "storage-azblob"),
                 not(feature = "storage-oss"),
                 not(feature = "storage-azdls"),
@@ -554,6 +516,14 @@ impl FileWrite for opendal::Writer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_gcs_storage_is_explicitly_unsupported() {
+        for scheme in ["gs", "gcs"] {
+            let error = OpenDalStorage::build(FileIOBuilder::new(scheme)).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::FeatureUnsupported);
+        }
+    }
 
     #[cfg(feature = "storage-memory")]
     #[test]

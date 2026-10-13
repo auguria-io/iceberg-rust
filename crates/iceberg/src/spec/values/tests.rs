@@ -78,7 +78,15 @@ fn check_convert_with_avro(expected_literal: Literal, expected_type: &Type) {
 
     let mut writer = apache_avro::Writer::new(&avro_schema, Vec::new());
     let raw_literal = RawLiteral::try_from(struct_literal.clone(), &struct_type).unwrap();
-    writer.append_ser(raw_literal).unwrap();
+    // Match ManifestWriter: resolve dynamic fields against the Avro schema before encoding.
+    writer
+        .append(
+            to_value(raw_literal)
+                .unwrap()
+                .resolve(&avro_schema)
+                .unwrap(),
+        )
+        .unwrap();
     let encoded = writer.into_inner().unwrap();
 
     let reader = apache_avro::Reader::new(&*encoded).unwrap();
@@ -112,6 +120,77 @@ fn check_serialize_avro(literal: Literal, ty: &Type, expect_value: Value) {
     let reader = apache_avro::Reader::new(&*encoded).unwrap();
     for record in reader {
         assert_eq!(record.unwrap(), expect_value);
+    }
+}
+
+#[test]
+fn record_serialization_releases_field_names() {
+    let ty = Type::Struct(StructType::new(vec![
+        NestedField::required(1000, "ingest_day", Primitive(PrimitiveType::Int)).into(),
+        NestedField::optional(1001, "product_name", Primitive(PrimitiveType::String)).into(),
+    ]));
+    for present in [false, true] {
+        let raw = RawLiteral::try_from(
+            Literal::Struct(Struct::from_iter([
+                Some(Literal::int(20000)),
+                present.then(|| Literal::string("router")),
+            ])),
+            &ty,
+        )
+        .unwrap();
+        // Measure the actual serializer, not Avro's shared schema/regex caches.
+        // Separate writer round trips check the resulting persisted values.
+        let allocations = allocation_counter::measure(|| {
+            for _ in 0..1024 {
+                drop(to_value(&raw).unwrap());
+            }
+        });
+        eprintln!(
+            "1024 record serializations (present={present}): retained bytes={}",
+            allocations.bytes_current
+        );
+        assert_eq!(
+            allocations.bytes_current, 0,
+            "temporary field names must be freed"
+        );
+    }
+}
+
+#[test]
+fn dynamic_record_fields_keep_avro_order_and_nulls() {
+    for suffix_len in [0, 16, 256] {
+        for present in [false, true] {
+            let optional_name = format!("a_{}", "x".repeat(suffix_len));
+            let required_name = format!("z_{}", "y".repeat(suffix_len));
+            // Schema order deliberately differs from required-then-optional order.
+            let ty = Type::Struct(StructType::new(vec![
+                NestedField::optional(10, &optional_name, Primitive(PrimitiveType::String)).into(),
+                NestedField::required(11, &required_name, Primitive(PrimitiveType::Long)).into(),
+                NestedField::required(12, "empty_record", Type::Struct(StructType::new(vec![])))
+                    .into(),
+            ]));
+            let literal = Literal::Struct(Struct::from_iter([
+                present.then(|| Literal::string("router")),
+                Some(Literal::long(20000)),
+                Some(Literal::Struct(Struct::empty())),
+            ]));
+            let optional_value = if present {
+                Value::Union(1, Box::new(Value::String("router".to_string())))
+            } else {
+                Value::Union(0, Box::new(Value::Null))
+            };
+            check_serialize_avro(
+                literal.clone(),
+                &ty,
+                Value::Record(vec![
+                    (optional_name, optional_value),
+                    (required_name, Value::Long(20000)),
+                    ("empty_record".to_string(), Value::Record(vec![])),
+                ]),
+            );
+            // Also check reconstruction of the original Iceberg literal.
+            check_convert_with_avro(literal, &ty);
+        }
     }
 }
 
@@ -785,7 +864,14 @@ fn check_convert_with_avro_map(expected_literal: Literal, expected_type: &Type) 
 
     let mut writer = apache_avro::Writer::new(&avro_schema, Vec::new());
     let raw_literal = RawLiteral::try_from(struct_literal.clone(), &struct_type).unwrap();
-    writer.append_ser(raw_literal).unwrap();
+    writer
+        .append(
+            to_value(raw_literal)
+                .unwrap()
+                .resolve(&avro_schema)
+                .unwrap(),
+        )
+        .unwrap();
     let encoded = writer.into_inner().unwrap();
 
     let reader = apache_avro::Reader::new(&*encoded).unwrap();

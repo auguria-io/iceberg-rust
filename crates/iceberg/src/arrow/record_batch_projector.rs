@@ -460,6 +460,7 @@ mod test {
     #[test]
     fn test_project_record_batch_locates_columns_by_field_id_after_reorder() {
         use std::collections::HashMap;
+
         use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
         let iceberg_schema = IcebergSchema::builder()
@@ -519,6 +520,7 @@ mod test {
     #[test]
     fn test_project_record_batch_errors_on_missing_field_id_in_tagged_batch() {
         use std::collections::HashMap;
+
         use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
         let iceberg_schema = IcebergSchema::builder()

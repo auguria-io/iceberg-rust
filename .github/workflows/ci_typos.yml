@@ -21,9 +21,11 @@ on:
   push:
     branches:
       - main
+      - greed/exact-base-transaction
   pull_request:
     branches:
       - main
+      - greed/exact-base-transaction
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}

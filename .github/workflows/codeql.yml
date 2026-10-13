@@ -21,9 +21,9 @@ name: "CodeQL"
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "greed/exact-base-transaction" ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ "main", "greed/exact-base-transaction" ]
   schedule:
     - cron: '16 4 * * 1'
 
