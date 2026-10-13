@@ -286,7 +286,8 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
             if found_deleted_files.is_empty() {
                 existing_files.push(manifest_file.clone());
             } else {
-                // Rewrite the manifest file without the deleted data files
+                // Rewrite the manifest file without the deleted data files. Other
+                // entries keep their status, snapshot id and sequence numbers.
                 if manifest
                     .entries()
                     .iter()
@@ -299,7 +300,7 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
 
                     for entry in manifest.entries() {
                         if !found_deleted_files.contains(entry.data_file().file_path()) {
-                            manifest_writer.add_entry((**entry).clone())?;
+                            manifest_writer.add_existing_entry((**entry).clone())?;
                         }
                     }
 
