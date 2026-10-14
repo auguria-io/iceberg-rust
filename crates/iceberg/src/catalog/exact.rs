@@ -77,6 +77,72 @@ impl Debug for ExactTableBase {
     }
 }
 
+/// A staged exact-base commit, ready for its single catalog request.
+///
+/// The catalog that staged it has already written the staged metadata object;
+/// nothing has been sent. The value is move-only: only
+/// [`crate::Catalog::send_table_exact`] consumes it, and it cannot be sent
+/// twice. Its token binds it to the staging catalog instance, the table, the
+/// base metadata location and version, and the staged metadata location.
+///
+/// ```compile_fail,E0382
+/// # async fn twice(catalog: &dyn iceberg::Catalog, prepared: iceberg::PreparedExactCommit) {
+/// let _ = catalog.send_table_exact(prepared).await;
+/// let _ = catalog.send_table_exact(prepared).await; // use of moved value
+/// # }
+/// ```
+pub struct PreparedExactCommit {
+    staged_metadata_location: String,
+    token: Box<dyn Any + Send + Sync>,
+}
+
+impl PreparedExactCommit {
+    /// Creates a prepared commit with a catalog-private token.
+    ///
+    /// Catalog implementations use this method when implementing
+    /// [`crate::Catalog::stage_table_exact`].
+    #[doc(hidden)]
+    pub fn new<T>(staged_metadata_location: String, token: T) -> Self
+    where T: Any + Send + Sync {
+        Self {
+            staged_metadata_location,
+            token: Box::new(token),
+        }
+    }
+
+    /// Returns the metadata object written by staging, which the catalog
+    /// request will make current.
+    pub fn staged_metadata_location(&self) -> &str {
+        &self.staged_metadata_location
+    }
+
+    /// Consumes the prepared commit and extracts its catalog-private token.
+    #[doc(hidden)]
+    pub fn into_parts<T>(self) -> Result<(String, T)>
+    where T: Any + Send + Sync {
+        let token = self.token.downcast::<T>().map_err(|_| {
+            Error::new(
+                ErrorKind::PreconditionFailed,
+                format!(
+                    "Prepared exact commit token does not belong to the expected catalog adapter ({})",
+                    type_name::<T>()
+                ),
+            )
+        })?;
+
+        Ok((self.staged_metadata_location, *token))
+    }
+}
+
+impl Debug for PreparedExactCommit {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedExactCommit")
+            .field("staged_metadata_location", &self.staged_metadata_location)
+            .field("token", &"<opaque>")
+            .finish()
+    }
+}
+
 /// Result of committing a transaction against an exact table base.
 #[derive(Debug)]
 pub enum ExactCommitOutcome {

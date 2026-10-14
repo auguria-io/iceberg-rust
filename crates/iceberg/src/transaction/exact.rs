@@ -19,7 +19,7 @@ use super::Transaction;
 use crate::table::Table;
 use crate::{
     Catalog, Error, ErrorKind, ExactCommitError, ExactCommitOutcome, ExactCommitResult,
-    ExactTableBase, TableCommit,
+    ExactTableBase, PreparedExactCommit, TableCommit,
 };
 
 impl Transaction {
@@ -34,6 +34,38 @@ impl Transaction {
         catalog: &dyn Catalog,
         base: ExactTableBase,
     ) -> ExactCommitResult<ExactCommitOutcome> {
+        match self.exact_commit(&base).await? {
+            Some(commit) => catalog
+                .update_table_exact(base, commit)
+                .await
+                .map(ExactCommitOutcome::Committed),
+            None => Ok(ExactCommitOutcome::Noop(self.table)),
+        }
+    }
+
+    /// Stages this transaction against a move-only exact table base without
+    /// sending it.
+    ///
+    /// The catalog writes the staged metadata and returns a move-only value
+    /// that only [`Catalog::send_table_exact`] on the same catalog instance
+    /// accepts. A transaction with no updates has nothing to stage and is
+    /// refused before CAS.
+    pub async fn stage_exact_base(
+        self,
+        catalog: &dyn Catalog,
+        base: ExactTableBase,
+    ) -> ExactCommitResult<PreparedExactCommit> {
+        let Some(commit) = self.exact_commit(&base).await? else {
+            return Err(ExactCommitError::before_cas(Error::new(
+                ErrorKind::PreconditionFailed,
+                "Exact transaction has no updates to stage",
+            )));
+        };
+        catalog.stage_table_exact(base, commit).await
+    }
+
+    /// Checks the base and applies the actions once; `None` means no updates.
+    async fn exact_commit(&self, base: &ExactTableBase) -> ExactCommitResult<Option<TableCommit>> {
         if !Self::matches_exact_base(&self.table, base.table()) {
             return Err(ExactCommitError::before_cas(Error::new(
                 ErrorKind::PreconditionFailed,
@@ -42,7 +74,7 @@ impl Transaction {
         }
 
         if self.actions.is_empty() {
-            return Ok(ExactCommitOutcome::Noop(self.table));
+            return Ok(None);
         }
 
         let (updates, requirements) = self
@@ -51,19 +83,16 @@ impl Transaction {
             .map_err(ExactCommitError::before_cas)?;
 
         if updates.is_empty() {
-            return Ok(ExactCommitOutcome::Noop(self.table));
+            return Ok(None);
         }
 
-        let commit = TableCommit::builder()
-            .ident(self.table.identifier().to_owned())
-            .updates(updates)
-            .requirements(requirements)
-            .build();
-
-        catalog
-            .update_table_exact(base, commit)
-            .await
-            .map(ExactCommitOutcome::Committed)
+        Ok(Some(
+            TableCommit::builder()
+                .ident(self.table.identifier().to_owned())
+                .updates(updates)
+                .requirements(requirements)
+                .build(),
+        ))
     }
 
     fn matches_exact_base(transaction_table: &Table, base_table: &Table) -> bool {
@@ -252,6 +281,43 @@ mod tests {
             error,
             ExactCommitError::ContendedNoMutation { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn stage_refuses_noop() {
+        let table = setup_test_table("9");
+        let mut catalog = exact_mock();
+        catalog.expect_stage_table_exact().times(0);
+
+        let error = Transaction::new(&table)
+            .stage_exact_base(&catalog, exact_base(&table))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ExactCommitError::BeforeCas { .. }));
+    }
+
+    #[tokio::test]
+    async fn other_catalogs_refuse_stage_and_send() {
+        let table = setup_test_table("9");
+        let catalog = crate::catalog::memory::tests::new_memory_catalog().await;
+
+        let error = transaction_with_update(&table)
+            .stage_exact_base(&catalog, exact_base(&table))
+            .await
+            .unwrap_err();
+        let ExactCommitError::BeforeCas { source } = error else {
+            panic!("staging must be refused before CAS");
+        };
+        assert_eq!(source.kind(), ErrorKind::FeatureUnsupported);
+
+        let prepared = PreparedExactCommit::new("s3://bucket/staged.json".to_string(), ());
+        let ExactCommitError::BeforeCas { source } =
+            catalog.send_table_exact(prepared).await.unwrap_err()
+        else {
+            panic!("sending must be refused before CAS");
+        };
+        assert_eq!(source.kind(), ErrorKind::FeatureUnsupported);
     }
 
     #[tokio::test]

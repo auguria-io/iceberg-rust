@@ -64,6 +64,7 @@ mod manifest_filter;
 pub use manifest_filter::*;
 mod overwrite_files;
 mod remove_snapshots;
+mod replace;
 mod rewrite_files;
 mod rewrite_manifests;
 mod snapshot;
