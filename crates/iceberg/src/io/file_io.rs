@@ -278,6 +278,59 @@ impl FileIO {
     }
 }
 
+/// Paths read and written through a [`FileIO`] built by
+/// [`FileIO::memory_with_log`], in call order.
+#[cfg(all(test, feature = "storage-memory"))]
+#[derive(Debug, Default)]
+pub(crate) struct IoLog {
+    pub(crate) reads: Vec<String>,
+    pub(crate) writes: Vec<String>,
+}
+
+#[cfg(all(test, feature = "storage-memory"))]
+impl FileIO {
+    /// Builds an in-memory [`FileIO`] that logs every read and write.
+    pub(crate) fn memory_with_log() -> (Self, Arc<std::sync::Mutex<IoLog>>) {
+        use opendal::layers::{LoggingInterceptor, LoggingLayer};
+        use opendal::raw::{AccessorInfo, Operation};
+
+        #[derive(Clone, Debug)]
+        struct Interceptor(Arc<std::sync::Mutex<IoLog>>);
+
+        impl LoggingInterceptor for Interceptor {
+            fn log(
+                &self,
+                _info: &AccessorInfo,
+                operation: Operation,
+                context: &[(&str, &str)],
+                message: &str,
+                _err: Option<&opendal::Error>,
+            ) {
+                let Some((_, path)) = context.iter().find(|(key, _)| *key == "path") else {
+                    return;
+                };
+                let mut log = self.0.lock().unwrap();
+                match (operation, message) {
+                    (Operation::Read, "started") => log.reads.push(path.to_string()),
+                    (Operation::Write, "started") => log.writes.push(path.to_string()),
+                    _ => {}
+                }
+            }
+        }
+
+        let log = Arc::new(std::sync::Mutex::new(IoLog::default()));
+        let operator = Operator::from_config(opendal::services::MemoryConfig::default())
+            .unwrap()
+            .finish()
+            .layer(LoggingLayer::new(Interceptor(Arc::clone(&log))));
+        let file_io = FileIO {
+            builder: FileIOBuilder::new("memory"),
+            inner: Arc::new(OpenDalStorage::Memory(operator)),
+        };
+        (file_io, log)
+    }
+}
+
 /// Container for storing type-safe extensions used to configure underlying FileIO behavior.
 #[derive(Clone, Debug, Default)]
 pub struct Extensions(HashMap<TypeId, Arc<dyn Any + Send + Sync>>);
