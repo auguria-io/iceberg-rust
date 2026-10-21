@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray,
@@ -24,7 +24,8 @@ use arrow_array::{
     Time64MicrosecondArray, TimestampMicrosecondArray, TimestampNanosecondArray,
 };
 use arrow_buffer::NullBuffer;
-use arrow_schema::{DataType, FieldRef, TimeUnit};
+use arrow_schema::{DataType, FieldRef, Fields, TimeUnit};
+use fnv::FnvHashMap;
 use uuid::Uuid;
 
 use super::get_field_id_from_metadata;
@@ -458,22 +459,85 @@ impl FieldMatchMode {
     }
 }
 
+/// Column positions of one arrow struct's fields, keyed the way a [`FieldMatchMode`] matches.
+///
+/// When several arrow fields carry the same key, the first one wins, as with a linear scan.
+enum FieldPositions {
+    Id(FnvHashMap<i32, usize>),
+    Name(FnvHashMap<String, usize>),
+}
+
+impl FieldPositions {
+    fn new(match_mode: FieldMatchMode, fields: &Fields) -> Self {
+        match match_mode {
+            FieldMatchMode::Id => {
+                let mut positions = FnvHashMap::default();
+                for (pos, field) in fields.iter().enumerate() {
+                    // A field without a parseable id never matches, as in `match_field`.
+                    if let Ok(id) = get_field_id_from_metadata(field) {
+                        positions.entry(id).or_insert(pos);
+                    }
+                }
+                Self::Id(positions)
+            }
+            FieldMatchMode::Name => {
+                let mut positions = FnvHashMap::default();
+                for (pos, field) in fields.iter().enumerate() {
+                    positions.entry(field.name().clone()).or_insert(pos);
+                }
+                Self::Name(positions)
+            }
+        }
+    }
+
+    fn get(&self, field: &NestedField) -> Option<usize> {
+        match self {
+            Self::Id(positions) => positions.get(&field.id).copied(),
+            Self::Name(positions) => positions.get(field.name.as_str()).copied(),
+        }
+    }
+}
+
 /// Partner type representing accessing and walking arrow arrays alongside iceberg schema
 pub struct ArrowArrayAccessor {
     match_mode: FieldMatchMode,
+    /// Field positions per arrow struct type, keyed by the address and length of its
+    /// `Fields`.
+    ///
+    /// Each entry holds a clone of the `Fields` it describes. That keeps the address
+    /// allocated, so no other `Fields` can take it while the entry lives, and a key
+    /// match means the same `Fields`. Positions depend only on the `Fields`, never on
+    /// array data. The cache lives as long as the accessor, so create one accessor per
+    /// walk, as `arrow_struct_to_literal` and `NanValueCountVisitor::compute` do.
+    positions: Mutex<FnvHashMap<(usize, usize), (Fields, FieldPositions)>>,
 }
 
 impl ArrowArrayAccessor {
     /// Creates a new instance of ArrowArrayAccessor with the default ID matching mode
     pub fn new() -> Self {
-        Self {
-            match_mode: FieldMatchMode::Id,
-        }
+        Self::new_with_match_mode(FieldMatchMode::Id)
     }
 
     /// Creates a new instance of ArrowArrayAccessor with the specified matching mode
     pub fn new_with_match_mode(match_mode: FieldMatchMode) -> Self {
-        Self { match_mode }
+        Self {
+            match_mode,
+            positions: Mutex::default(),
+        }
+    }
+
+    /// Returns the column position of `field` in a struct of type `fields`.
+    ///
+    /// Builds the position map on first sight of `fields`, so a walk over a struct
+    /// with n fields costs O(n) instead of O(n²) metadata lookups.
+    fn field_position(&self, fields: &Fields, field: &NestedField) -> Option<usize> {
+        let key = (fields.as_ptr() as usize, fields.len());
+        // A poisoned lock only means another walk panicked; the map is still valid.
+        let mut cache = self.positions.lock().unwrap_or_else(|e| e.into_inner());
+        let (_, positions) = cache
+            .entry(key)
+            .or_insert_with(|| (fields.clone(), FieldPositions::new(self.match_mode, fields)));
+        positions.get(field)
     }
 }
 
@@ -512,10 +576,8 @@ impl PartnerAccessor<ArrayRef> for ArrowArrayAccessor {
                 )
             })?;
 
-        let field_pos = struct_array
-            .fields()
-            .iter()
-            .position(|arrow_field| self.match_mode.match_field(arrow_field, field))
+        let field_pos = self
+            .field_position(struct_array.fields(), field)
             .ok_or_else(|| {
                 Error::new(
                     ErrorKind::DataInvalid,
