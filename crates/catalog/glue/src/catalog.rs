@@ -31,7 +31,7 @@ use iceberg::spec::{TableMetadata, TableMetadataBuilder};
 use iceberg::table::Table;
 use iceberg::{
     Catalog, CatalogBuilder, Error, ErrorKind, ExactCommitResult, ExactTableBase, MetadataLocation,
-    Namespace, NamespaceIdent, Result, TableCommit, TableCreation, TableIdent,
+    Namespace, NamespaceIdent, PreparedExactCommit, Result, TableCommit, TableCreation, TableIdent,
 };
 
 use crate::error::{from_aws_build_error, from_aws_sdk_error};
@@ -860,5 +860,17 @@ impl Catalog for GlueCatalog {
         commit: TableCommit,
     ) -> ExactCommitResult<Table> {
         self.update_table_exact_impl(base, commit).await
+    }
+
+    async fn stage_table_exact(
+        &self,
+        base: ExactTableBase,
+        commit: TableCommit,
+    ) -> ExactCommitResult<PreparedExactCommit> {
+        self.stage_table_exact_impl(base, commit).await
+    }
+
+    async fn send_table_exact(&self, prepared: PreparedExactCommit) -> ExactCommitResult<Table> {
+        self.send_table_exact_impl(prepared).await
     }
 }

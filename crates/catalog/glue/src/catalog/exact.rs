@@ -23,8 +23,10 @@ use aws_sdk_glue::operation::update_table::UpdateTableError;
 use aws_sdk_glue::types::TableInput;
 use iceberg::table::Table;
 use iceberg::{
-    Error, ErrorKind, ExactCommitError, ExactCommitResult, ExactTableBase, TableCommit, TableIdent,
+    Error, ErrorKind, ExactCommitBinding, ExactCommitError, ExactCommitResult, ExactTableBase,
+    PreparedExactCommit, TableCommit, TableIdent,
 };
+use sha2::{Digest, Sha256};
 
 use super::GlueCatalog;
 use crate::utils::{convert_to_glue_table, validate_namespace};
@@ -38,6 +40,8 @@ struct GlueExactToken {
 }
 
 struct PreparedExactUpdate {
+    catalog_identity: Arc<()>,
+    binding: ExactCommitBinding,
     table_ident: TableIdent,
     table_namespace: String,
     staged_table: Table,
@@ -85,6 +89,57 @@ impl GlueCatalog {
         self.send_exact_update(prepared).await
     }
 
+    pub(super) async fn stage_table_exact_impl(
+        &self,
+        base: ExactTableBase,
+        commit: TableCommit,
+    ) -> ExactCommitResult<PreparedExactCommit> {
+        let (base_table, token) = self.consume_exact_base(base, &commit)?;
+        let prepared = self.prepare_exact_update(base_table, commit, token).await?;
+        Ok(PreparedExactCommit::new(prepared.binding.clone(), prepared))
+    }
+
+    /// Checks a staged commit's binding, then makes its one request.
+    pub(super) async fn send_table_exact_impl(
+        &self,
+        prepared: PreparedExactCommit,
+    ) -> ExactCommitResult<Table> {
+        let (binding, prepared) = prepared
+            .into_parts::<PreparedExactUpdate>()
+            .map_err(before_cas)?;
+        if !Arc::ptr_eq(&self.exact_identity, &prepared.catalog_identity) {
+            return Err(before_cas(Error::new(
+                ErrorKind::PreconditionFailed,
+                "Prepared exact commit belongs to a different Glue catalog instance",
+            )));
+        }
+        if binding != prepared.binding {
+            return Err(before_cas(Error::new(
+                ErrorKind::PreconditionFailed,
+                "Prepared exact commit binding was changed after staging",
+            )));
+        }
+        let stored = prepared
+            .staged_table
+            .file_io()
+            .new_input(&prepared.staged_metadata_location)
+            .map_err(before_cas)?
+            .read()
+            .await
+            .map_err(before_cas)?;
+        if <[u8; 32]>::from(Sha256::digest(&stored)) != prepared.binding.staged_metadata_sha256 {
+            return Err(before_cas(Error::new(
+                ErrorKind::PreconditionFailed,
+                format!(
+                    "Staged metadata {} changed after staging",
+                    prepared.staged_metadata_location
+                ),
+            )));
+        }
+
+        self.send_exact_update(prepared).await
+    }
+
     fn consume_exact_base(
         &self,
         base: ExactTableBase,
@@ -127,17 +182,33 @@ impl GlueCatalog {
             staged_metadata_location.clone(),
             staged_table.metadata(),
             staged_table.metadata().properties(),
-            Some(token.metadata_location),
+            Some(token.metadata_location.clone()),
         )
         .map_err(before_cas)?;
 
+        // Serialize once, so the digest covers exactly the bytes written. This
+        // writes what `TableMetadata::write_to` writes.
+        let bytes =
+            serde_json::to_vec(staged_table.metadata()).map_err(|e| before_cas(Error::from(e)))?;
+        let binding = ExactCommitBinding {
+            table: table_ident.clone(),
+            table_uuid: staged_table.metadata().uuid(),
+            base_metadata_location: token.metadata_location,
+            base_version_id: Some(token.version_id.clone()),
+            staged_metadata_location: staged_metadata_location.clone(),
+            staged_metadata_sha256: Sha256::digest(&bytes).into(),
+        };
         staged_table
-            .metadata()
-            .write_to(staged_table.file_io(), &staged_metadata_location)
+            .file_io()
+            .new_output(&staged_metadata_location)
+            .map_err(before_cas)?
+            .write(bytes.into())
             .await
             .map_err(before_cas)?;
 
         Ok(PreparedExactUpdate {
+            catalog_identity: token.catalog_identity,
+            binding,
             table_ident,
             table_namespace,
             staged_table,
@@ -319,7 +390,11 @@ mod tests {
     }
 
     fn exact_transaction(base: &ExactTableBase) -> Transaction {
-        let tx = Transaction::new(base.table());
+        exact_transaction_on(base.table())
+    }
+
+    fn exact_transaction_on(table: &Table) -> Transaction {
+        let tx = Transaction::new(table);
         tx.update_table_properties()
             .set("exact-key".to_string(), "value".to_string())
             .apply(tx)
@@ -466,6 +541,220 @@ mod tests {
 
         assert!(matches!(error, ExactCommitError::BeforeCas { .. }));
         drop(catalog);
+    }
+
+    async fn load_base(
+        server: &mut Server,
+        catalog: &GlueCatalog,
+        table_ident: &TableIdent,
+        metadata_location: &str,
+    ) -> ExactTableBase {
+        let get_table = mock_get_table(
+            server,
+            table_ident,
+            metadata_location.to_string(),
+            Some("17"),
+        )
+        .await;
+        let base = catalog.load_table_exact(table_ident).await.unwrap();
+        get_table.assert_async().await;
+        base
+    }
+
+    /// An `UpdateTable` mock that answers success `hits` times.
+    async fn mock_update(server: &mut Server, hits: usize) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_header("x-amz-target", "AWSGlue.UpdateTable")
+            .with_status(200)
+            .with_header("content-type", "application/x-amz-json-1.1")
+            .with_body("{}")
+            .expect(hits)
+            .create_async()
+            .await
+    }
+
+    fn assert_before_cas(error: ExactCommitError) {
+        assert!(
+            matches!(error, ExactCommitError::BeforeCas { .. }),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_then_send_split() {
+        let mut server = Server::new_async().await;
+        let temp_dir = TempDir::new().unwrap();
+        let (catalog, table_ident, base) = exact_fixture(&mut server, &temp_dir).await;
+        let base_location = base.table().metadata_location().unwrap().to_string();
+        let base_uuid = base.table().metadata().uuid();
+
+        let no_send = mock_update(&mut server, 0).await;
+        let prepared = exact_transaction(&base)
+            .stage_exact_base(&catalog, base)
+            .await
+            .unwrap();
+        no_send.assert_async().await;
+        no_send.remove_async().await;
+
+        let binding = prepared.binding().clone();
+        let staged = catalog
+            .file_io()
+            .new_input(&binding.staged_metadata_location)
+            .unwrap()
+            .read()
+            .await
+            .expect("stage writes the staged metadata before any request");
+        assert_eq!(binding, ExactCommitBinding {
+            table: table_ident,
+            table_uuid: base_uuid,
+            base_metadata_location: base_location.clone(),
+            base_version_id: Some("17".to_string()),
+            staged_metadata_location: binding.staged_metadata_location.clone(),
+            staged_metadata_sha256: Sha256::digest(&staged).into(),
+        });
+        assert_ne!(binding.staged_metadata_location, base_location);
+        let staged_metadata: iceberg::spec::TableMetadata =
+            serde_json::from_slice(&staged).unwrap();
+        assert_eq!(staged_metadata.uuid(), base_uuid);
+        assert_eq!(staged_metadata.properties()["exact-key"], "value");
+
+        let send = server
+            .mock("POST", "/")
+            .match_header("x-amz-target", "AWSGlue.UpdateTable")
+            .match_body(Matcher::Regex(r#"\"VersionId\":\"17\""#.to_string()))
+            .match_body(Matcher::Regex(format!(
+                r#"\"metadata_location\":\"{}\""#,
+                binding.staged_metadata_location
+            )))
+            .match_body(Matcher::Regex(format!(
+                r#"\"previous_metadata_location\":\"{base_location}\""#
+            )))
+            .with_status(200)
+            .with_header("content-type", "application/x-amz-json-1.1")
+            .with_body("{}")
+            .expect(1)
+            .create_async()
+            .await;
+        let committed = catalog.send_table_exact(prepared).await.unwrap();
+
+        send.assert_async().await;
+        assert_eq!(
+            committed.metadata_location(),
+            Some(binding.staged_metadata_location.as_str())
+        );
+        assert_eq!(committed.metadata().properties()["exact-key"], "value");
+    }
+
+    #[tokio::test]
+    async fn prepared_commit_binding() {
+        // Fails to compile if PreparedExactCommit ever becomes Clone, which
+        // would allow a second send of the same staged commit.
+        trait AmbiguousIfClone<A> {
+            fn probe() {}
+        }
+        impl<T> AmbiguousIfClone<()> for T {}
+        impl<T: Clone> AmbiguousIfClone<u8> for T {}
+        <PreparedExactCommit as AmbiguousIfClone<_>>::probe();
+
+        let mut server = Server::new_async().await;
+        let temp_dir = TempDir::new().unwrap();
+        let no_send = mock_update(&mut server, 0).await;
+        let (catalog, table_ident, metadata_location) = test_catalog(&server, &temp_dir).await;
+        let (other_catalog, _, _) = test_catalog(&server, &temp_dir).await;
+        let stage =
+            |base: ExactTableBase| exact_transaction(&base).stage_exact_base(&catalog, base);
+
+        // Catalog instance: staged by one instance, sent through another.
+        let base = load_base(&mut server, &catalog, &table_ident, &metadata_location).await;
+        let prepared = stage(base).await.unwrap();
+        assert_before_cas(other_catalog.send_table_exact(prepared).await.unwrap_err());
+
+        // Catalog instance: a base from one instance staged through another.
+        let base = load_base(&mut server, &catalog, &table_ident, &metadata_location).await;
+        let error = exact_transaction(&base)
+            .stage_exact_base(&other_catalog, base)
+            .await
+            .unwrap_err();
+        assert_before_cas(error);
+
+        // Table: a transaction for another table.
+        let base = load_base(&mut server, &catalog, &table_ident, &metadata_location).await;
+        let other_table = Table::builder()
+            .file_io(base.table().file_io().clone())
+            .metadata(base.table().metadata_ref())
+            .metadata_location(metadata_location.clone())
+            .identifier(TableIdent::from_strs(["db", "other"]).unwrap())
+            .build()
+            .unwrap();
+        let error = exact_transaction_on(&other_table)
+            .stage_exact_base(&catalog, base)
+            .await
+            .unwrap_err();
+        assert_before_cas(error);
+
+        // Base version: the receipt's table moved off the location it was
+        // loaded at.
+        let base = load_base(&mut server, &catalog, &table_ident, &metadata_location).await;
+        let (table, token) = base.into_parts::<GlueExactToken>().unwrap();
+        let newer = metadata_location
+            .parse::<MetadataLocation>()
+            .unwrap()
+            .with_next_version()
+            .to_string();
+        let moved = Table::builder()
+            .file_io(table.file_io().clone())
+            .metadata(table.metadata_ref())
+            .metadata_location(newer)
+            .identifier(table.identifier().clone())
+            .build()
+            .unwrap();
+        let base = ExactTableBase::new(moved.clone(), token);
+        let error = exact_transaction_on(&moved)
+            .stage_exact_base(&catalog, base)
+            .await
+            .unwrap_err();
+        assert_before_cas(error);
+
+        // Staged metadata digest: the object changed between stage and send.
+        let base = load_base(&mut server, &catalog, &table_ident, &metadata_location).await;
+        let prepared = stage(base).await.unwrap();
+        let staged = prepared.binding().staged_metadata_location.clone();
+        let output = catalog.file_io().new_output(&staged).unwrap();
+        let mut bytes = catalog
+            .file_io()
+            .new_input(&staged)
+            .unwrap()
+            .read()
+            .await
+            .unwrap()
+            .to_vec();
+        bytes.push(b' ');
+        output.write(bytes.into()).await.unwrap();
+        assert_before_cas(catalog.send_table_exact(prepared).await.unwrap_err());
+
+        // Staged metadata digest: the object is gone.
+        let base = load_base(&mut server, &catalog, &table_ident, &metadata_location).await;
+        let prepared = stage(base).await.unwrap();
+        let staged = prepared.binding().staged_metadata_location.clone();
+        catalog.file_io().delete(&staged).await.unwrap();
+        assert_before_cas(catalog.send_table_exact(prepared).await.unwrap_err());
+
+        // The public binding cannot be changed to report something else.
+        let base = load_base(&mut server, &catalog, &table_ident, &metadata_location).await;
+        let prepared = stage(base).await.unwrap();
+        let (mut binding, update) = prepared.into_parts::<PreparedExactUpdate>().unwrap();
+        binding.staged_metadata_location = format!("{metadata_location}.other");
+        let relabelled = PreparedExactCommit::new(binding, update);
+        assert_before_cas(catalog.send_table_exact(relabelled).await.unwrap_err());
+
+        // A prepared value from another adapter.
+        let base = load_base(&mut server, &catalog, &table_ident, &metadata_location).await;
+        let binding = stage(base).await.unwrap().binding().clone();
+        let foreign = PreparedExactCommit::new(binding, ());
+        assert_before_cas(catalog.send_table_exact(foreign).await.unwrap_err());
+
+        no_send.assert_async().await;
     }
 
     #[tokio::test]
