@@ -18,8 +18,10 @@
 use std::any::{Any, type_name};
 use std::fmt::{Debug, Display, Formatter};
 
+use uuid::Uuid;
+
 use crate::table::Table;
-use crate::{Error, ErrorKind, Result};
+use crate::{Error, ErrorKind, Result, TableIdent};
 
 /// An exact table base loaded by a catalog.
 ///
@@ -72,6 +74,90 @@ impl Debug for ExactTableBase {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExactTableBase")
             .field("table", &self.table)
+            .field("token", &"<opaque>")
+            .finish()
+    }
+}
+
+/// What a [`PreparedExactCommit`] is bound to, for the caller to record before
+/// it sends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExactCommitBinding {
+    /// The table the commit updates.
+    pub table: TableIdent,
+    /// The table UUID of the base and of the staged metadata.
+    pub table_uuid: Uuid,
+    /// The metadata location of the exact base.
+    pub base_metadata_location: String,
+    /// The catalog's version of the base, when it has one (Glue: `VersionId`).
+    /// The send is conditioned on it.
+    pub base_version_id: Option<String>,
+    /// The metadata object that staging wrote and the send makes current.
+    pub staged_metadata_location: String,
+    /// SHA-256 of the bytes staging wrote there. The send reads the object
+    /// again and refuses before its request if the bytes differ.
+    pub staged_metadata_sha256: [u8; 32],
+}
+
+/// A staged exact-base commit, ready for its single catalog request.
+///
+/// The catalog that staged it has written the staged metadata object and sent
+/// nothing. The value is move-only: only [`crate::Catalog::send_table_exact`]
+/// on the staging catalog instance accepts it, and it cannot be sent twice.
+///
+/// ```compile_fail,E0382
+/// # async fn twice(catalog: &dyn iceberg::Catalog, prepared: iceberg::PreparedExactCommit) {
+/// let _ = catalog.send_table_exact(prepared).await;
+/// let _ = catalog.send_table_exact(prepared).await; // use of moved value
+/// # }
+/// ```
+pub struct PreparedExactCommit {
+    binding: ExactCommitBinding,
+    token: Box<dyn Any + Send + Sync>,
+}
+
+impl PreparedExactCommit {
+    /// Creates a prepared commit with a catalog-private token.
+    ///
+    /// Catalog implementations use this method when implementing
+    /// [`crate::Catalog::stage_table_exact`]. The token must hold everything
+    /// the send uses; the binding is a copy for the caller.
+    #[doc(hidden)]
+    pub fn new<T>(binding: ExactCommitBinding, token: T) -> Self
+    where T: Any + Send + Sync {
+        Self {
+            binding,
+            token: Box::new(token),
+        }
+    }
+
+    /// Returns what this commit is bound to.
+    pub fn binding(&self) -> &ExactCommitBinding {
+        &self.binding
+    }
+
+    /// Consumes the prepared commit and extracts its catalog-private token.
+    #[doc(hidden)]
+    pub fn into_parts<T>(self) -> Result<(ExactCommitBinding, T)>
+    where T: Any + Send + Sync {
+        let token = self.token.downcast::<T>().map_err(|_| {
+            Error::new(
+                ErrorKind::PreconditionFailed,
+                format!(
+                    "Prepared exact commit token does not belong to the expected catalog adapter ({})",
+                    type_name::<T>()
+                ),
+            )
+        })?;
+
+        Ok((self.binding, *token))
+    }
+}
+
+impl Debug for PreparedExactCommit {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedExactCommit")
+            .field("binding", &self.binding)
             .field("token", &"<opaque>")
             .finish()
     }

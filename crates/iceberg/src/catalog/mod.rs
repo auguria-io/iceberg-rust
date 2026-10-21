@@ -131,6 +131,31 @@ pub trait Catalog: Debug + Sync + Send {
             format!("Catalog does not support exact-base updates for table {table}"),
         )))
     }
+
+    /// Stages an exact-base commit without sending it: writes the staged
+    /// metadata and returns the move-only value that
+    /// [`Catalog::send_table_exact`] sends.
+    async fn stage_table_exact(
+        &self,
+        base: ExactTableBase,
+        _commit: TableCommit,
+    ) -> ExactCommitResult<PreparedExactCommit> {
+        let table = base.table().identifier();
+        Err(ExactCommitError::before_cas(Error::new(
+            ErrorKind::FeatureUnsupported,
+            format!("Catalog does not support exact-base staging for table {table}"),
+        )))
+    }
+
+    /// Sends a commit staged by this catalog instance, once, conditional on
+    /// its exact base.
+    async fn send_table_exact(&self, prepared: PreparedExactCommit) -> ExactCommitResult<Table> {
+        let table = &prepared.binding().table;
+        Err(ExactCommitError::before_cas(Error::new(
+            ErrorKind::FeatureUnsupported,
+            format!("Catalog does not support sending staged exact-base commits for table {table}"),
+        )))
+    }
 }
 
 /// Common interface for all catalog builders.
