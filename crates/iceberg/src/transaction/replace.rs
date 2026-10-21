@@ -184,7 +184,7 @@ pub async fn prepare_replace(
         });
     }
     let mut action = producer
-        .commit(Carry(manifests), DefaultManifestProcess)
+        .commit(PlannedManifests(manifests), DefaultManifestProcess)
         .await?;
 
     Ok(PreparedReplace {
@@ -400,9 +400,9 @@ impl ReplaceInput {
 }
 
 /// Supplies the planned manifests; the inputs are already recorded in them.
-struct Carry(Vec<ManifestFile>);
+struct PlannedManifests(Vec<ManifestFile>);
 
-impl SnapshotProduceOperation for Carry {
+impl SnapshotProduceOperation for PlannedManifests {
     fn operation(&self) -> Operation {
         Operation::Replace
     }
