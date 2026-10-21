@@ -64,6 +64,9 @@ mod manifest_filter;
 pub use manifest_filter::*;
 mod overwrite_files;
 mod remove_snapshots;
+mod replace;
+
+pub use replace::{ManifestView, PreparedReplace, ReplaceInput, ViewManifest, prepare_replace};
 mod rewrite_files;
 mod rewrite_manifests;
 mod snapshot;
