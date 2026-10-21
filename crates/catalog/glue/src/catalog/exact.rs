@@ -757,6 +757,117 @@ mod tests {
         no_send.assert_async().await;
     }
 
+    /// F2 feeds F1: prepare a replace on a Glue exact base, stage it, send it.
+    #[tokio::test]
+    async fn replace_stages_and_sends() {
+        use iceberg::spec::{DataContentType, DataFile, DataFileBuilder, DataFileFormat, Struct};
+        use iceberg::transaction::{
+            ApplyTransactionAction, ManifestView, ReplaceInput, ViewManifest, prepare_replace,
+        };
+
+        let mut server = Server::new_async().await;
+        let temp_dir = TempDir::new().unwrap();
+        let (catalog, table_ident, metadata_location) = test_catalog(&server, &temp_dir).await;
+        let data = |name: &str| -> DataFile {
+            DataFileBuilder::default()
+                .content(DataContentType::Data)
+                .file_path(format!(
+                    "{}/table/data/{name}.parquet",
+                    temp_dir.path().display()
+                ))
+                .file_format(DataFileFormat::Parquet)
+                .file_size_in_bytes(100)
+                .record_count(1)
+                .partition(Struct::empty())
+                .partition_spec_id(0)
+                .build()
+                .unwrap()
+        };
+
+        // Append a and b, and stage and send that as the table's next version.
+        let base = load_base(&mut server, &catalog, &table_ident, &metadata_location).await;
+        let tx = Transaction::new(base.table());
+        let tx = tx
+            .fast_append()
+            .add_data_files([data("a"), data("b")])
+            .apply(tx)
+            .unwrap();
+        let append_send = mock_update(&mut server, 1).await;
+        let prepared = tx.stage_exact_base(&catalog, base).await.unwrap();
+        let appended = catalog.send_table_exact(prepared).await.unwrap();
+        append_send.assert_async().await;
+        append_send.remove_async().await;
+
+        // Replace a with c on that version.
+        let base = load_base(
+            &mut server,
+            &catalog,
+            &table_ident,
+            appended.metadata_location().unwrap(),
+        )
+        .await;
+        let snapshot = base.table().metadata().current_snapshot().unwrap().clone();
+        let list = snapshot
+            .load_manifest_list(base.table().file_io(), base.table().metadata())
+            .await
+            .unwrap();
+        let manifest = &list.entries()[0];
+        let view = ManifestView {
+            snapshot_id: snapshot.snapshot_id(),
+            manifests: vec![ViewManifest {
+                path: manifest.manifest_path.clone(),
+                length: manifest.manifest_length,
+                content: manifest.content,
+                partition_spec_id: manifest.partition_spec_id,
+            }],
+        };
+        let input = ReplaceInput {
+            manifest_path: manifest.manifest_path.clone(),
+            data_file: data("a"),
+            data_sequence_number: 1,
+            file_sequence_number: 1,
+        };
+        let replace = prepare_replace(&base, &view, vec![input], vec![data("c")])
+            .await
+            .unwrap();
+        let replace_id = replace.snapshot_id();
+
+        let no_send = mock_update(&mut server, 0).await;
+        let prepared = replace.stage(&catalog, base).await.unwrap();
+        no_send.assert_async().await;
+        no_send.remove_async().await;
+        let binding = prepared.binding().clone();
+        assert_eq!(
+            binding.base_metadata_location,
+            appended.metadata_location().unwrap()
+        );
+
+        let send = server
+            .mock("POST", "/")
+            .match_header("x-amz-target", "AWSGlue.UpdateTable")
+            .match_body(Matcher::Regex(r#"\"VersionId\":\"17\""#.to_string()))
+            .match_body(Matcher::Regex(format!(
+                r#"\"metadata_location\":\"{}\""#,
+                binding.staged_metadata_location
+            )))
+            .with_status(200)
+            .with_header("content-type", "application/x-amz-json-1.1")
+            .with_body("{}")
+            .expect(1)
+            .create_async()
+            .await;
+        let committed = catalog.send_table_exact(prepared).await.unwrap();
+        send.assert_async().await;
+
+        let current = committed.metadata().current_snapshot().unwrap();
+        assert_eq!(current.snapshot_id(), replace_id);
+        assert_eq!(current.parent_snapshot_id(), Some(snapshot.snapshot_id()));
+        assert_eq!(current.sequence_number(), 2);
+        let summary = &current.summary().additional_properties;
+        assert_eq!(summary["total-data-files"], "2");
+        assert_eq!(summary["deleted-data-files"], "1");
+    }
+
     #[tokio::test]
     async fn update_types_only_modeled_concurrency_as_contention() {
         let mut server = Server::new_async().await;
