@@ -6,9 +6,9 @@ credentials to its Actions workflows or publish dependency sources/build caches.
 Public CI checks formatting and static source quality only. A green public check
 is **not** evidence that compilation, unit tests, or integration tests passed.
 
-Build, lint and unit/mock validation runs in the private `auguria-io/rust-pkgs`
-repository, in the **Fork Dependency Validation** workflow. Its reviewed
-`.github/fork-validation.json` records immutable revisions. It checks that the
+Lockfile audit, build, lint and unit/mock validation runs in the private `auguria-io/rust-pkgs`
+repository, in the **Iceberg Security Validation** workflow. Its reviewed
+`.github/iceberg-security-validation.json` records immutable revisions. It checks that the
 open PR heads match those revisions before and after the tests. It does not
 follow arbitrary contributor branches or upload artifacts to this repository.
 
