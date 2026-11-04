@@ -17,6 +17,7 @@
 
 //! Catalog API for Apache Iceberg
 
+mod exact;
 pub mod memory;
 mod metadata_location;
 
@@ -30,6 +31,7 @@ use std::sync::Arc;
 
 use _serde::{deserialize_snapshot, serialize_snapshot};
 use async_trait::async_trait;
+pub use exact::*;
 pub use memory::MemoryCatalog;
 pub use metadata_location::*;
 #[cfg(test)]
@@ -108,6 +110,27 @@ pub trait Catalog: Debug + Sync + Send {
 
     /// Update a table to the catalog.
     async fn update_table(&self, commit: TableCommit) -> Result<Table>;
+
+    /// Loads a move-only receipt for an opt-in exact-base commit.
+    async fn load_table_exact(&self, table: &TableIdent) -> ExactCommitResult<ExactTableBase> {
+        Err(ExactCommitError::before_cas(Error::new(
+            ErrorKind::FeatureUnsupported,
+            format!("Catalog does not support exact-base loads for table {table}"),
+        )))
+    }
+
+    /// Updates a table only if the supplied exact base is still current.
+    async fn update_table_exact(
+        &self,
+        base: ExactTableBase,
+        _commit: TableCommit,
+    ) -> ExactCommitResult<Table> {
+        let table = base.table().identifier();
+        Err(ExactCommitError::before_cas(Error::new(
+            ErrorKind::FeatureUnsupported,
+            format!("Catalog does not support exact-base updates for table {table}"),
+        )))
+    }
 }
 
 /// Common interface for all catalog builders.

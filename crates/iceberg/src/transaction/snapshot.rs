@@ -936,21 +936,15 @@ partition_struct: {:?}, partition_type: {:?}",
 
         let mut duplicate_files = Vec::new();
 
-        // Load all manifests concurrently, then scan entries
+        // Drop each decoded manifest before loading the next. Even a one-file
+        // append must check the current inventory, but must not retain it all.
         if let Some(current_snapshot) = branch_snapshot_ref {
             let manifest_list = current_snapshot
                 .load_manifest_list(table.file_io(), table.metadata_ref().as_ref())
                 .await?;
 
-            let manifest_files: Vec<_> = manifest_list.entries().to_vec();
-            let loaded_manifests = load_manifests(
-                table.file_io(),
-                manifest_files,
-                crate::utils::DEFAULT_LOAD_CONCURRENCY_LIMIT,
-            )
-            .await?;
-
-            'outer: for (_, manifest) in &loaded_manifests {
+            for manifest_file in manifest_list.entries() {
+                let manifest = manifest_file.load_manifest(table.file_io()).await?;
                 for entry in manifest.entries() {
                     if !entry.is_alive() {
                         continue;
@@ -969,9 +963,10 @@ partition_struct: {:?}, partition_type: {:?}",
                         files_to_delete.remove(file_path);
                     }
 
-                    // Early exit optimization: if both checks are done, stop scanning
+                    // Stop scanning this manifest once the checks are complete,
+                    // but still load later manifests so read errors cannot be hidden.
                     if duplicate_files.len() == files_to_add.len() && files_to_delete.is_empty() {
-                        break 'outer;
+                        break;
                     }
                 }
             }

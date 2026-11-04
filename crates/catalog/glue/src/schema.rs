@@ -25,8 +25,8 @@ pub(crate) const ICEBERG_FIELD_CURRENT: &str = "iceberg.field.current";
 use std::collections::{HashMap, HashSet};
 
 use aws_sdk_glue::types::Column;
-use iceberg::spec::{PrimitiveType, SchemaVisitor, TableMetadata, visit_schema};
 use iceberg::Result;
+use iceberg::spec::{PrimitiveType, SchemaVisitor, TableMetadata, visit_schema};
 
 use crate::error::from_aws_build_error;
 
@@ -181,9 +181,7 @@ impl SchemaVisitor for GlueSchemaBuilder {
             // implicitly UTC, so tz-aware Iceberg timestamps map onto
             // them without semantic loss. Athena reads both as UTC.
             PrimitiveType::Timestamp | PrimitiveType::Timestamptz => "timestamp".to_string(),
-            PrimitiveType::TimestampNs | PrimitiveType::TimestamptzNs => {
-                "timestamp_ns".to_string()
-            }
+            PrimitiveType::TimestampNs | PrimitiveType::TimestamptzNs => "timestamp_ns".to_string(),
             PrimitiveType::Time | PrimitiveType::String | PrimitiveType::Uuid => {
                 "string".to_string()
             }

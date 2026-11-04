@@ -74,7 +74,6 @@ pub const IO_RETRY_MAX_DELAY_MS: &str = "io.retry.max-delay-ms";
 /// | Local file system  | `storage-fs`      | `file`                           | `file://path/to/file`         |
 /// | Memory             | `storage-memory`  | `memory`                         | `memory://path/to/file`       |
 /// | S3                 | `storage-s3`      | `s3`, `s3a`                      | `s3://<bucket>/path/to/file`  |
-/// | GCS                | `storage-gcs`     | `gs`, `gcs`                      | `gs://<bucket>/path/to/file`  |
 /// | OSS                | `storage-oss`     | `oss`                            | `oss://<bucket>/path/to/file` |
 /// | Azure Datalake     | `storage-azdls`   | `abfs`, `abfss`, `wasb`, `wasbs` | `abfs://<filesystem>@<account>.dfs.core.windows.net/path/to/file` or `wasb://<container>@<account>.blob.core.windows.net/path/to/file` |
 /// | AZBLOB             | `storage-azblob`  | `azblob`                         | `azblob://<container>/path/to/file` |

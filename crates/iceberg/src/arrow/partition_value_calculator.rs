@@ -209,8 +209,8 @@ impl PartitionValueCalculator {
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{Array, DictionaryArray, Int32Array, RecordBatch, RunArray, StringArray};
     use arrow_array::types::Int32Type;
+    use arrow_array::{Array, DictionaryArray, Int32Array, RecordBatch, RunArray, StringArray};
     use arrow_schema::{Field, Schema as ArrowSchema};
 
     use super::*;
@@ -326,7 +326,10 @@ mod tests {
             .downcast_ref::<StringArray>()
             .expect("partition value column should be a plain StringArray");
         assert_eq!(product_partition.len(), 3);
-        assert!(!product_partition.is_null(0), "row 0 partition value is NULL — read-side REE constant did not flow through");
+        assert!(
+            !product_partition.is_null(0),
+            "row 0 partition value is NULL — read-side REE constant did not flow through"
+        );
         assert_eq!(product_partition.value(0), "cisco_meraki_events");
         assert_eq!(product_partition.value(1), "cisco_meraki_events");
         assert_eq!(product_partition.value(2), "cisco_meraki_events");
@@ -359,9 +362,8 @@ mod tests {
 
         let keys = Int32Array::from(vec![0, 0, 0]);
         let values = StringArray::from(vec!["cisco_meraki_events"]);
-        let dict_array: ArrayRef = Arc::new(
-            DictionaryArray::<Int32Type>::try_new(keys, Arc::new(values)).unwrap(),
-        );
+        let dict_array: ArrayRef =
+            Arc::new(DictionaryArray::<Int32Type>::try_new(keys, Arc::new(values)).unwrap());
 
         let arrow_schema = Arc::new(ArrowSchema::new(vec![
             Field::new("id", DataType::Int32, false),

@@ -54,8 +54,14 @@ arrow-string = "58"
 as-any = "0.3.2"
 async-trait = "0.1.89"
 aws-config = "1.8.7"
-aws-sdk-glue = "1.39"
-aws-sdk-s3tables = "1.28.0"
+aws-sdk-glue = { version = "1.39", default-features = false, features = [
+  "default-https-client",
+  "rt-tokio",
+] }
+aws-sdk-s3tables = { version = "1.28.0", default-features = false, features = [
+  "default-https-client",
+  "rt-tokio",
+] }
 backon = "1.5.1"
 base64 = "0.22.1"
 bimap = "0.6"
@@ -72,6 +78,10 @@ dirs = "6"
 enum-ordinalize = "4.3.0"
 env_logger = "0.11.8"
 expect-test = "1"
+fastnum = { version = "0.7", default-features = false, features = [
+  "std",
+  "serde",
+] }
 faststr = "0.2.31"
 flate2 = "1.1.5"
 fnv = "1.0.7"
@@ -109,7 +119,6 @@ rand = "0.8.5"
 regex = "1.11.3"
 reqwest = { version = "0.12.12", default-features = false, features = ["json"] }
 roaring = { version = "0.11" }
-fastnum = { version = "0.7", default-features = false, features = ["std", "serde"] }
 serde = { version = "1.0.219", features = ["rc"] }
 serde_bytes = "0.11.17"
 serde_derive = "1.0.219"
@@ -121,7 +130,7 @@ sqlx = { version = "0.8.1", default-features = false }
 stacker = "0.1.20"
 strum = "0.27.2"
 tempfile = "3.18"
-thrift = "0.17.0"
+thrift = "0.23.0"
 tokio = { version = "1.47", default-features = false }
 toml = "0.8"
 tracing = "0.1.41"
@@ -133,3 +142,21 @@ uuid = { version = "1.18", features = ["v7"] }
 volo = "0.10.6"
 volo-thrift = "0.10.8"
 zstd = "0.13.3"
+
+# Use the reviewed Arrow 58 security fixes without a major-version upgrade.
+[patch.crates-io]
+arrow = { git = "https://github.com/auguria-io/arrow-rs-internal", rev = "3b76e4ebb2e546c1671f36a0431168a0dfbd6def" }
+arrow-arith = { git = "https://github.com/auguria-io/arrow-rs-internal", rev = "3b76e4ebb2e546c1671f36a0431168a0dfbd6def" }
+arrow-array = { git = "https://github.com/auguria-io/arrow-rs-internal", rev = "3b76e4ebb2e546c1671f36a0431168a0dfbd6def" }
+arrow-buffer = { git = "https://github.com/auguria-io/arrow-rs-internal", rev = "3b76e4ebb2e546c1671f36a0431168a0dfbd6def" }
+arrow-cast = { git = "https://github.com/auguria-io/arrow-rs-internal", rev = "3b76e4ebb2e546c1671f36a0431168a0dfbd6def" }
+arrow-csv = { git = "https://github.com/auguria-io/arrow-rs-internal", rev = "3b76e4ebb2e546c1671f36a0431168a0dfbd6def" }
+arrow-data = { git = "https://github.com/auguria-io/arrow-rs-internal", rev = "3b76e4ebb2e546c1671f36a0431168a0dfbd6def" }
+arrow-ipc = { git = "https://github.com/auguria-io/arrow-rs-internal", rev = "3b76e4ebb2e546c1671f36a0431168a0dfbd6def" }
+arrow-json = { git = "https://github.com/auguria-io/arrow-rs-internal", rev = "3b76e4ebb2e546c1671f36a0431168a0dfbd6def" }
+arrow-ord = { git = "https://github.com/auguria-io/arrow-rs-internal", rev = "3b76e4ebb2e546c1671f36a0431168a0dfbd6def" }
+arrow-row = { git = "https://github.com/auguria-io/arrow-rs-internal", rev = "3b76e4ebb2e546c1671f36a0431168a0dfbd6def" }
+arrow-schema = { git = "https://github.com/auguria-io/arrow-rs-internal", rev = "3b76e4ebb2e546c1671f36a0431168a0dfbd6def" }
+arrow-select = { git = "https://github.com/auguria-io/arrow-rs-internal", rev = "3b76e4ebb2e546c1671f36a0431168a0dfbd6def" }
+arrow-string = { git = "https://github.com/auguria-io/arrow-rs-internal", rev = "3b76e4ebb2e546c1671f36a0431168a0dfbd6def" }
+parquet = { git = "https://github.com/auguria-io/arrow-rs-internal", rev = "3b76e4ebb2e546c1671f36a0431168a0dfbd6def" }

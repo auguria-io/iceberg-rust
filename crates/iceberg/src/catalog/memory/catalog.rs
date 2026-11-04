@@ -18,6 +18,7 @@
 //! This module contains memory catalog implementation.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::lock::{Mutex, MutexGuard};
@@ -28,9 +29,11 @@ use crate::io::FileIO;
 use crate::spec::{TableMetadata, TableMetadataBuilder};
 use crate::table::Table;
 use crate::{
-    Catalog, CatalogBuilder, Error, ErrorKind, MetadataLocation, Namespace, NamespaceIdent, Result,
-    TableCommit, TableCreation, TableIdent,
+    Catalog, CatalogBuilder, Error, ErrorKind, ExactCommitResult, ExactTableBase, MetadataLocation,
+    Namespace, NamespaceIdent, Result, TableCommit, TableCreation, TableIdent,
 };
+
+mod exact;
 
 /// Memory catalog warehouse location
 pub const MEMORY_CATALOG_WAREHOUSE: &str = "warehouse";
@@ -108,6 +111,8 @@ pub struct MemoryCatalog {
     root_namespace_state: Mutex<NamespaceState>,
     file_io: FileIO,
     warehouse_location: String,
+    /// Per-instance identity used to bind exact-base receipts to this catalog.
+    exact_identity: Arc<()>,
 }
 
 impl MemoryCatalog {
@@ -119,6 +124,7 @@ impl MemoryCatalog {
                 .with_props(config.props)
                 .build()?,
             warehouse_location: config.warehouse,
+            exact_identity: Arc::new(()),
         })
     }
 
@@ -378,6 +384,21 @@ impl Catalog for MemoryCatalog {
 
         Ok(updated_table)
     }
+
+    async fn load_table_exact(
+        &self,
+        table_ident: &TableIdent,
+    ) -> ExactCommitResult<ExactTableBase> {
+        self.load_table_exact_impl(table_ident).await
+    }
+
+    async fn update_table_exact(
+        &self,
+        base: ExactTableBase,
+        commit: TableCommit,
+    ) -> ExactCommitResult<Table> {
+        self.update_table_exact_impl(base, commit).await
+    }
 }
 
 #[cfg(test)]
@@ -394,6 +415,7 @@ pub(crate) mod tests {
     use crate::io::FileIOBuilder;
     use crate::spec::{NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder, Type};
     use crate::transaction::{ApplyTransactionAction, Transaction};
+    use crate::{ExactCommitError, ExactCommitOutcome};
 
     fn temp_path() -> String {
         let temp_dir = TempDir::new().unwrap();
@@ -1867,6 +1889,80 @@ pub(crate) mod tests {
         assert!(
             table.metadata().metadata_log().len() < updated_table.metadata().metadata_log().len()
         );
+    }
+
+    #[tokio::test]
+    async fn test_exact_update_commits_against_loaded_base() {
+        let catalog = new_memory_catalog().await;
+        let table = create_table_with_namespace(&catalog).await;
+        let base = catalog.load_table_exact(table.identifier()).await.unwrap();
+        let tx = Transaction::new(base.table());
+        let tx = tx
+            .update_table_properties()
+            .set("exact-key".to_string(), "value".to_string())
+            .apply(tx)
+            .unwrap();
+
+        let outcome = tx.commit_exact_base(&catalog, base).await.unwrap();
+
+        let ExactCommitOutcome::Committed(updated) = outcome else {
+            panic!("exact memory update must commit");
+        };
+        assert_eq!(
+            updated
+                .metadata()
+                .properties()
+                .get("exact-key")
+                .map(String::as_str),
+            Some("value")
+        );
+        assert_eq!(
+            catalog
+                .load_table(table.identifier())
+                .await
+                .unwrap()
+                .metadata_location(),
+            updated.metadata_location()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_exact_update_rejects_stale_base_without_pointer_mutation() {
+        let catalog = new_memory_catalog().await;
+        let table = create_table_with_namespace(&catalog).await;
+        let base = catalog.load_table_exact(table.identifier()).await.unwrap();
+        let exact_tx = Transaction::new(base.table());
+        let exact_tx = exact_tx
+            .update_table_properties()
+            .set("exact-key".to_string(), "loser".to_string())
+            .apply(exact_tx)
+            .unwrap();
+
+        let writer_tx = Transaction::new(&table);
+        let writer_table = writer_tx
+            .update_table_properties()
+            .set("writer-key".to_string(), "winner".to_string())
+            .apply(writer_tx)
+            .unwrap()
+            .commit(&catalog)
+            .await
+            .unwrap();
+
+        let error = exact_tx
+            .commit_exact_base(&catalog, base)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ExactCommitError::ContendedNoMutation { .. }
+        ));
+        let current = catalog.load_table(table.identifier()).await.unwrap();
+        assert_eq!(
+            current.metadata_location(),
+            writer_table.metadata_location()
+        );
+        assert!(!current.metadata().properties().contains_key("exact-key"));
     }
 
     #[tokio::test]

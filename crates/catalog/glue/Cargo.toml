@@ -40,3 +40,5 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 iceberg_test_utils = { path = "../../test_utils", features = ["tests"] }
+mockito = { workspace = true }
+tempfile = { workspace = true }

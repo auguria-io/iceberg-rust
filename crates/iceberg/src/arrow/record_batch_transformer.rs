@@ -1777,10 +1777,9 @@ mod test {
             .expect("with_partition should accept the virtual column path")
             .build();
 
-        let file_batch = RecordBatch::try_new(
-            file_schema,
-            vec![Arc::new(Int32Array::from(vec![10, 20, 30]))],
-        )
+        let file_batch = RecordBatch::try_new(file_schema, vec![Arc::new(Int32Array::from(vec![
+            10, 20, 30,
+        ]))])
         .unwrap();
 
         let result = transformer.process_record_batch(file_batch).unwrap();
@@ -1800,20 +1799,29 @@ mod test {
         // must materialize as the canonical flat Utf8 — NOT RunEndEncoded — so a
         // backfilled file can concat with a file that stores the column physically
         // (plan-46 Task 7).
-        let pn_col = result.column(1);
+        let product_name_column = result.column(1);
         assert_eq!(
-            pn_col.data_type(),
+            product_name_column.data_type(),
             &DataType::Utf8,
             "partition constant must be flat Utf8, not RunEndEncoded, so cross-file concat works"
         );
         assert!(
-            pn_col.as_any().downcast_ref::<StringArray>().is_some(),
+            product_name_column
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .is_some(),
             "expected a flat StringArray for the backfilled partition constant"
         );
-        let extracted = get_string_value(pn_col, 0);
+        let extracted = get_string_value(product_name_column, 0);
         assert_eq!(extracted, "cisco_meraki_events");
-        assert_eq!(get_string_value(pn_col, 1), "cisco_meraki_events");
-        assert_eq!(get_string_value(pn_col, 2), "cisco_meraki_events");
+        assert_eq!(
+            get_string_value(product_name_column, 1),
+            "cisco_meraki_events"
+        );
+        assert_eq!(
+            get_string_value(product_name_column, 2),
+            "cisco_meraki_events"
+        );
     }
 
     /// Regression test mirror: when the parquet *does* carry the
@@ -1859,11 +1867,9 @@ mod test {
             .unwrap()
             .build();
 
-        let file_batch = RecordBatch::try_new(
-            file_schema,
-            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
-        )
-        .unwrap();
+        let file_batch =
+            RecordBatch::try_new(file_schema, vec![Arc::new(Int32Array::from(vec![1, 2, 3]))])
+                .unwrap();
 
         let result = transformer.process_record_batch(file_batch).unwrap();
         let x_col = result
@@ -1936,7 +1942,11 @@ mod test {
         // File B: product_name PRESENT in parquet → read through as flat Utf8.
         let mut transformer_b =
             RecordBatchTransformerBuilder::new(schema.clone(), &projected_field_ids)
-                .with_partition(partition_spec, partition_data, &[1, 2].into_iter().collect())
+                .with_partition(
+                    partition_spec,
+                    partition_data,
+                    &[1, 2].into_iter().collect(),
+                )
                 .unwrap()
                 .build();
         let batch_b = RecordBatch::try_new(
