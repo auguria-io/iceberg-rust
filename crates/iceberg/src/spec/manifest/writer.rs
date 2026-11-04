@@ -328,15 +328,17 @@ impl ManifestWriter {
         Ok(())
     }
 
-    /// Add an existing manifest entry. This method will update following status of the entry:
-    /// - Update the entry status to `Existing`
+    /// Add an existing manifest entry, keeping its snapshot id and sequence numbers.
+    /// A live entry becomes `Existing`; a `Deleted` entry stays deleted.
     ///
     /// # TODO
     /// Remove this allow later
     #[allow(dead_code)]
     pub(crate) fn add_existing_entry(&mut self, mut entry: ManifestEntry) -> Result<()> {
         self.check_data_file(&entry.data_file)?;
-        entry.status = ManifestStatus::Existing;
+        if entry.is_alive() {
+            entry.status = ManifestStatus::Existing;
+        }
         self.add_entry_inner(entry)?;
         Ok(())
     }

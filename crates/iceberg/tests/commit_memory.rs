@@ -17,9 +17,10 @@
 
 //! Local-only regression tests for commit validation and manifest allocation.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalog, MemoryCatalogBuilder};
+use iceberg::spec::ManifestStatus::{self, Added, Deleted, Existing};
 use iceberg::spec::{
     DataContentType, DataFile, DataFileBuilder, DataFileFormat, FormatVersion, Literal,
     NestedField, PrimitiveType, Schema, Struct, StructType, Type, read_data_files_from_avro,
@@ -333,4 +334,237 @@ async fn deleted_entry_does_not_block_readding_a_path() {
         .commit(&catalog)
         .await
         .unwrap();
+}
+
+const S1: i64 = 1001;
+const S2: i64 = 1002;
+const S3: i64 = 1003;
+const S4: i64 = 1004;
+
+fn data(name: &str, rows: u64) -> DataFile {
+    DataFileBuilder::default()
+        .partition_spec_id(0)
+        .content(DataContentType::Data)
+        .file_path(format!("memory:///data/{name}.parquet"))
+        .file_format(DataFileFormat::Parquet)
+        .file_size_in_bytes(100)
+        .record_count(rows)
+        .partition(Struct::empty())
+        .build()
+        .unwrap()
+}
+
+/// A committed manifest entry: file name, status, snapshot id, data sequence,
+/// file sequence and record count.
+type Entry = (String, ManifestStatus, i64, i64, i64, u64);
+
+fn entry(
+    name: &str,
+    status: ManifestStatus,
+    snapshot: i64,
+    seq: i64,
+    file_seq: i64,
+    rows: u64,
+) -> Entry {
+    (name.to_string(), status, snapshot, seq, file_seq, rows)
+}
+
+fn sorted(mut entries: Vec<Entry>) -> Vec<Entry> {
+    entries.sort_by(|a, b| (&a.0, a.2, a.3).cmp(&(&b.0, b.2, b.3)));
+    entries
+}
+
+/// Every entry of every manifest in the current snapshot, alive or not, by
+/// manifest.
+async fn manifests(table: &Table) -> Vec<Vec<Entry>> {
+    let list = table
+        .metadata()
+        .current_snapshot()
+        .unwrap()
+        .load_manifest_list(table.file_io(), &table.metadata_ref())
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    for manifest in list.entries() {
+        let mut entries = Vec::new();
+        for e in manifest
+            .load_manifest(table.file_io())
+            .await
+            .unwrap()
+            .entries()
+        {
+            let name = e.file_path().trim_start_matches("memory:///data/");
+            entries.push(entry(
+                name.trim_end_matches(".parquet"),
+                e.status(),
+                e.snapshot_id().unwrap(),
+                e.sequence_number().unwrap(),
+                e.file_sequence_number().unwrap(),
+                e.record_count(),
+            ));
+        }
+        out.push(entries);
+    }
+    out
+}
+
+/// Commits `added` and the removal of `removed` as snapshot `snapshot_id`:
+/// a fast append without removals, otherwise a rewrite.
+async fn commit(
+    catalog: &MemoryCatalog,
+    table: &Table,
+    snapshot_id: i64,
+    removed: Vec<DataFile>,
+    added: Vec<DataFile>,
+    merge: bool,
+) -> Table {
+    let tx = Transaction::new(table);
+    let tx = if removed.is_empty() {
+        tx.fast_append()
+            .set_snapshot_id(snapshot_id)
+            .add_data_files(added)
+            .apply(tx)
+    } else {
+        let mut action = tx
+            .rewrite_files()
+            .set_snapshot_id(snapshot_id)
+            .delete_files(removed)
+            .add_data_files(added);
+        if merge {
+            action.set_snapshot_properties(HashMap::from([
+                (
+                    "commit.manifest-merge.enabled".to_string(),
+                    "true".to_string(),
+                ),
+                (
+                    "commit.manifest.min-count-to-merge".to_string(),
+                    "2".to_string(),
+                ),
+            ]));
+        }
+        action.apply(tx)
+    };
+    tx.unwrap().commit(catalog).await.unwrap()
+}
+
+/// Checks every entry of the current snapshot except its own tombstones
+/// against `expected`, then that its tombstones cover exactly `removed` and
+/// that live entries and the summary hold `live_rows` rows.
+async fn assert_entries(table: &Table, removed: &[&str], expected: Vec<Entry>, live_rows: u64) {
+    let snapshot = table.metadata().current_snapshot().unwrap();
+    let id = snapshot.snapshot_id();
+    let (own, carried): (Vec<_>, Vec<_>) = manifests(table)
+        .await
+        .into_iter()
+        .flatten()
+        .partition(|e| e.1 == Deleted && e.2 == id);
+    assert_eq!(sorted(carried.clone()), sorted(expected), "snapshot {id}");
+    let tombstoned: BTreeSet<_> = own.iter().map(|e| e.0.as_str()).collect();
+    assert_eq!(
+        tombstoned,
+        removed.iter().copied().collect(),
+        "snapshot {id}"
+    );
+    let rows: u64 = carried.iter().filter(|e| e.1 != Deleted).map(|e| e.5).sum();
+    assert_eq!(rows, live_rows, "snapshot {id} live rows");
+    assert_eq!(
+        snapshot.summary().additional_properties["total-records"],
+        live_rows.to_string()
+    );
+}
+
+#[tokio::test]
+async fn replace_keeps_mixed_manifest_siblings_and_tombstones() {
+    for merge in [false, true] {
+        let (catalog, table) = fixture(0, 0).await;
+        let (a, b, c, d, e) = (
+            data("a", 1),
+            data("b", 2),
+            data("c", 4),
+            data("d", 8),
+            data("e", 16),
+        );
+        let table = commit(&catalog, &table, S1, vec![], vec![a.clone(), b], false).await;
+        let table = commit(&catalog, &table, S2, vec![], vec![c.clone()], false).await;
+        // A merged replace writes one manifest holding Existing a and b,
+        // Added d and Deleted c.
+        let table = commit(&catalog, &table, S3, vec![c], vec![d], true).await;
+        assert_entries(
+            &table,
+            &["c"],
+            vec![
+                entry("a", Existing, S1, 1, 1, 1),
+                entry("b", Existing, S1, 1, 1, 2),
+                entry("d", Added, S3, 3, 3, 8),
+            ],
+            11,
+        )
+        .await;
+        assert_eq!(manifests(&table).await.len(), 1);
+
+        let table = commit(&catalog, &table, S4, vec![a], vec![e], merge).await;
+        let mut expected = vec![
+            entry("b", Existing, S1, 1, 1, 2),
+            entry("d", Existing, S3, 3, 3, 8),
+            entry("e", Added, S4, 4, 4, 16),
+        ];
+        // A merge drops tombstones of earlier snapshots; a plain rewrite keeps them.
+        if !merge {
+            expected.push(entry("c", Deleted, S3, 2, 2, 4));
+        }
+        assert_entries(&table, &["a"], expected, 26).await;
+    }
+}
+
+/// {a, b} -> ab -> a -> a3: removing the re-added a must not revive b from
+/// the tombstone manifest it shares with the old a.
+#[tokio::test]
+async fn repeated_replace_never_revives_a_tombstone() {
+    for merge in [false, true] {
+        let (catalog, table) = fixture(0, 0).await;
+        let (a, b, ab, a3) = (data("a", 1), data("b", 2), data("ab", 3), data("a3", 1));
+        let table = commit(
+            &catalog,
+            &table,
+            S1,
+            vec![],
+            vec![a.clone(), b.clone()],
+            false,
+        )
+        .await;
+        let table = commit(
+            &catalog,
+            &table,
+            S2,
+            vec![a.clone(), b],
+            vec![ab.clone()],
+            merge,
+        )
+        .await;
+        assert_entries(
+            &table,
+            &["a", "b"],
+            vec![entry("ab", Added, S2, 2, 2, 3)],
+            3,
+        )
+        .await;
+
+        let table = commit(&catalog, &table, S3, vec![ab], vec![a.clone()], merge).await;
+        let mut expected = vec![entry("a", Added, S3, 3, 3, 1)];
+        if !merge {
+            expected.push(entry("a", Deleted, S2, 1, 1, 1));
+            expected.push(entry("b", Deleted, S2, 1, 1, 2));
+        }
+        assert_entries(&table, &["ab"], expected, 1).await;
+
+        // Removing a path also re-tombstones its older Deleted entry under S4;
+        // this checks only that b stays dead and ab keeps its tombstone.
+        let table = commit(&catalog, &table, S4, vec![a], vec![a3], merge).await;
+        let mut expected = vec![entry("a3", Added, S4, 4, 4, 1)];
+        if !merge {
+            expected.push(entry("b", Deleted, S2, 1, 1, 2));
+            expected.push(entry("ab", Deleted, S3, 2, 2, 3));
+        }
+        assert_entries(&table, &["a"], expected, 1).await;
+    }
 }
